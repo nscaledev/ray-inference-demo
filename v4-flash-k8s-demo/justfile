@@ -560,8 +560,19 @@ _bench_start name label claim svc concurrency runs max_tokens="256":
       echo "    kubectl -n {{ns}} delete job bench-in-cluster"
       exit 1
     fi
+    # WAIT for the old Job to be GONE, do not sleep and hope. A Job takes longer than a few
+    # seconds to disappear, and `kubectl apply` against a still-terminating Job with a different
+    # spec does NOT replace it — so the previous run's Job survives and _job-wait then reports
+    # ITS outcome. That happened: a stale bench-d Job left over from a killed sequence made the
+    # B-without-DSpark leg report a DNS failure against v4-flash-replicas, a Service that
+    # belonged to a different strategy entirely. The concurrency guard above only catches
+    # ACTIVE Jobs; this catches stale ones.
     kubectl -n {{ns}} delete job bench-in-cluster --ignore-not-found >/dev/null 2>&1
-    sleep 3
+    for i in $(seq 1 40); do
+      kubectl -n {{ns}} get job bench-in-cluster >/dev/null 2>&1 || break
+      [ "$i" = "40" ] && { echo "FATAL: previous bench Job will not go away"; exit 1; }
+      sleep 3
+    done
     kubectl -n {{ns}} create configmap bench-src --from-file=bench.py=bench.py \
       --dry-run=client -o yaml | kubectl apply -f - >/dev/null
     sed -e "s|__NS__|{{ns}}|g" -e "s|__NAME__|{{name}}|g" -e "s|__SVC__|{{svc}}|g" \
@@ -622,12 +633,16 @@ _kv-tokens name:
     # An empty pat means "this strategy has no RayJob" -> read the replica pods.
     skip=""
     case "{{name}}" in
-      A-tep8*)          pat=tep8 ;;
+      # A moved from a RayJob to a Deployment (10b) because the RayJob variant emits garbage,
+      # so its KV line is in the pod's own log, not the head's driver logs. Leaving it in the
+      # RayJob branch made compare.py show "—" for the deck's headline strategy.
+      A-tep8*)          pat=""; dep=v4-flash-tep8 ;;
       B-dp8-ep-nospec*) pat=nospec ;;
       B-dp8-ep*)        pat=dp8-ep; skip=nospec ;;
       C-pd*)            pat=decode ;;
       *)                pat="" ;;
     esac
+    dep="${dep:-}"
     if [ -n "$pat" ]; then
       h=$(kubectl -n {{ns}} get pod -l ray.io/node-type=head -o name 2>/dev/null | head -1 | cut -d/ -f2)
       if [ -n "${h:-}" ]; then
@@ -643,7 +658,9 @@ _kv-tokens name:
       fi
       echo "0"; exit 0        # a RayJob strategy must NOT fall through to the replicas
     fi
-    p=$(kubectl -n {{ns}} get pod -l app=v4-flash-replica -o name 2>/dev/null | head -1 | cut -d/ -f2)
+    sel="app=v4-flash-replica"
+    [ -n "$dep" ] && sel="app=$dep"
+    p=$(kubectl -n {{ns}} get pod -l "$sel" -o name 2>/dev/null | head -1 | cut -d/ -f2)
     if [ -n "${p:-}" ]; then
       n=$(kubectl -n {{ns}} logs "$p" 2>/dev/null | grep -hoE "GPU KV cache size: [0-9,]+ tokens" | tail -1 | grep -oE '[0-9,]+' | tr -d ,)
       [ -n "${n:-}" ] && { echo "$n"; exit 0; }
@@ -822,6 +839,10 @@ repeat-tour rounds="2":
     done
 
 # Median / min / max / spread across every repeat — flags anything above 1.5x.
+[doc("Derive every deck/abstract claim from the measurements, with provenance")]
+claims:
+    @python3 claims.py
+
 [doc("Median and spread across repeat runs — is a number a measurement yet?")]
 stability:
     @python3 stability.py metrics/_repeat
