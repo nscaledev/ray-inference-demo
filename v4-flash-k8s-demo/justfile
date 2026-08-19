@@ -105,8 +105,19 @@ wait-ready port="8000" svc="v4-flash-openai" budget="540":
         sleep 2
       fi
       if curl -sf -m 4 "localhost:{{port}}/v1/models" >/dev/null 2>&1; then
-        echo "ready after ~$((i * 5))s"
-        exit 0
+        # /v1/models answers as soon as the port is bound. Autotune and CUDA-graph capture DO
+        # finish first (measured: 8m19s of autotune, then "Application startup complete"), but
+        # per-shape TileLang JIT does not — vLLM logs "JIT compilation during inference" on the
+        # first request of an unseen shape. So prove it can GENERATE before saying ready;
+        # otherwise a flow proceeds to measure an engine that is minutes from serving at speed.
+        echo "endpoint answering after ~$((i * 5))s; checking it can generate"
+        body=$(python3 make_request.py "{{model}}" "ping" 1)
+        if curl -sf -m 120 "localhost:{{port}}/v1/chat/completions" \
+             -H 'content-type: application/json' -d "$body" 2>/dev/null | grep -q '"choices"'; then
+          echo "ready: generated after ~$((i * 5))s"
+          exit 0
+        fi
+        echo "  ... bound but not generating yet (kernels still compiling)"
       fi
       [ $((i % 24)) -eq 0 ] && echo "  ... $((i * 5))s elapsed: weights, then ~8-12 min DeepGEMM JIT, then ~10 min FlashInfer autotune"
       sleep 5

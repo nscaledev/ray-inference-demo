@@ -110,9 +110,42 @@ spec:
             - { name: VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR, value: /root/.cache/flashinfer }
             - { name: PATH, value: "/models/ray-site/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
           ports: [{ containerPort: 8000 }]
+          # STARTUP GATE: Ready must mean "has generated", not "has bound a port".
+          #
+          # Measured on this cluster, the startup order is:
+          #   08:10:01  FlashInfer autotune begins (trtllm_fp4_block_scale_moe, 10 profiles)
+          #   08:18:26  autotune done - 8m19s
+          #   08:19:05  CUDA graph capture done
+          #   08:19:09  "Application startup complete"  <- first traffic accepted
+          # So autotune and graph capture ALREADY gate the endpoint; there is nothing to force.
+          #
+          # What is NOT gated is per-shape TileLang JIT, which fires on the first request of a
+          # shape the engine has not seen -- vLLM logs "TileLang JIT compilation during
+          # inference ... consider extending warmup to cover this shape/config". A pod that
+          # passes /health can therefore still be minutes from serving at speed, and while it
+          # sits in the Service's endpoints it takes real traffic cold: measured ~400 tok/s
+          # against a warm replica's ~2300.
+          #
+          # A startupProbe that GENERATES fixes that where it belongs. Until one real completion
+          # succeeds the container is not Ready, so it is absent from the Service and cannot be
+          # sent traffic. readinessProbe does not even run until this passes, so this costs one
+          # request, not one per period.
+          startupProbe:
+            exec:
+              command:
+                - bash
+                - -lc
+                - >-
+                  curl -sf -m 90 localhost:8000/v1/chat/completions
+                  -H 'content-type: application/json'
+                  -d '{"model":"deepseek-ai/DeepSeek-V4-Flash-0731","messages":[{"role":"user","content":"ping"}],"max_tokens":1}'
+                  | grep -q '"choices"'
+            periodSeconds: 15
+            # 15s x 120 = 30 min, comfortably past the ~20 min cold start. Too small a budget
+            # here is the same false-alarm class as the 600s progressDeadlineSeconds default.
+            failureThreshold: 120
           readinessProbe:
             httpGet: { path: /health, port: 8000 }
-            initialDelaySeconds: 120
             periodSeconds: 10
             failureThreshold: 90
           resources:
