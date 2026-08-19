@@ -111,7 +111,7 @@ wait-ready port="8000" svc="v4-flash-openai" budget="540":
         # first request of an unseen shape. So prove it can GENERATE before saying ready;
         # otherwise a flow proceeds to measure an engine that is minutes from serving at speed.
         echo "endpoint answering after ~$((i * 5))s; checking it can generate"
-        body=$(python3 make_request.py "{{model}}" "ping" 1)
+        body=$(python3 make_request.py "{{model}}" "ping" 1 "localhost:{{port}}/v1/chat/completions")
         if curl -sf -m 120 "localhost:{{port}}/v1/chat/completions" \
              -H 'content-type: application/json' -d "$body" 2>/dev/null | grep -q '"choices"'; then
           echo "ready: generated after ~$((i * 5))s"
@@ -172,7 +172,8 @@ ask prompt="One sentence: why keep expert routing on NVLink?" svc="" port="8000"
     probe=$(kubectl -n {{ns}} get pods -l ray.io/node-type=head --field-selector=status.phase=Running -o name 2>/dev/null | head -1 | cut -d/ -f2)
     [ -z "$probe" ] && probe=$(kubectl -n {{ns}} get pods -l app=v4-flash-longctx --field-selector=status.phase=Running -o name 2>/dev/null | head -1 | cut -d/ -f2)
     [ -z "$probe" ] && { echo "no vLLM pod to ask from"; exit 1; }
-    body=$(python3 make_request.py "{{model}}" "{{prompt}}")
+    # make_request.py prints the call on stderr (visible) and the JSON body on stdout.
+    body=$(python3 make_request.py "{{model}}" "{{prompt}}" 200 "http://$svc:$port/v1/chat/completions")
     kubectl -n {{ns}} exec "$probe" -- curl -s -m 300 "http://$svc:$port/v1/chat/completions" -H 'content-type: application/json' -d "$body" > /tmp/just-ask.json 2>/dev/null
     python3 show_answer.py /tmp/just-ask.json
 

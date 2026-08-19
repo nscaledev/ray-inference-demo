@@ -65,6 +65,27 @@ def build(tokens, depth, secret, tag):
     )
 
 
+# Duplicated in bench.py, longctx.py and make_request.py on purpose: the in-cluster Jobs mount
+# a ConfigMap containing exactly ONE file, so a shared module would not be present at runtime.
+# Six lines beats adding a second --from-file to two Job templates.
+def describe_call(url, body, prompt_key="messages", limit=100):
+    """One auditable line per API call: what was sent, where, with the prompt trimmed.
+
+    Printed so the audience can see the demo is a plain OpenAI-compatible POST and nothing is
+    hidden in the harness — the whole talk asks people to rerun this, so the request has to be
+    visible. Newlines are collapsed and the prompt is truncated to `limit` chars with its true
+    length shown, because a 1M-token prompt is ~5.8 MB and must never be echoed in full.
+    """
+    msgs = body.get(prompt_key) or []
+    prompt = (msgs[0].get("content", "") if msgs else "")
+    flat = " ".join(prompt.split())
+    shown = flat[:limit] + ("…" if len(flat) > limit else "")
+    opts = " ".join(f"{k}={body[k]}" for k in ("max_tokens", "temperature", "stream") if k in body)
+    return (f"→ POST {url}\n"
+            f"    model={body.get('model')} {opts}\n"
+            f'    prompt[{len(prompt):,} chars]: "{shown}"')
+
+
 def ask(url, model, prompt, max_tokens=48, timeout=1800):
     body = json.dumps({
         "model": model,
@@ -74,6 +95,7 @@ def ask(url, model, prompt, max_tokens=48, timeout=1800):
         "stream": True,
         "stream_options": {"include_usage": True},
     }).encode()
+    print(describe_call(url, json.loads(body)), flush=True)
     req = urllib.request.Request(url, data=body,
                                 headers={"content-type": "application/json"})
     start = time.perf_counter()

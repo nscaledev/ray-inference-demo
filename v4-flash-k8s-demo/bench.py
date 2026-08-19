@@ -21,6 +21,27 @@ PROMPT = (
 )
 
 
+# Duplicated in bench.py, longctx.py and make_request.py on purpose: the in-cluster Jobs mount
+# a ConfigMap containing exactly ONE file, so a shared module would not be present at runtime.
+# Six lines beats adding a second --from-file to two Job templates.
+def describe_call(url, body, limit=100):
+    """One auditable line per API call: what was sent, where, with the prompt trimmed.
+
+    Printed so the audience can see the demo is a plain OpenAI-compatible POST with nothing
+    hidden in the harness — the talk asks people to rerun this, so the request has to be
+    visible. Newlines are collapsed and the prompt is truncated to `limit` chars with its true
+    length shown, because a 1M-token prompt is ~5.8 MB and must never be echoed in full.
+    """
+    msgs = body.get("messages") or []
+    prompt = (msgs[0].get("content", "") if msgs else "")
+    flat = " ".join(prompt.split())
+    shown = flat[:limit] + ("\u2026" if len(flat) > limit else "")
+    opts = " ".join(f"{k}={body[k]}" for k in ("max_tokens", "temperature", "stream") if k in body)
+    return (f"\u2192 POST {url}\n"
+            f"    model={body.get('model')} {opts}\n"
+            f'    prompt[{len(prompt):,} chars]: "{shown}"')
+
+
 def stream_once(url, model, max_tokens, prompt=PROMPT):
     """One streaming completion. Returns (ttft_s, tpot_s, output_tokens, total_s)."""
     body = json.dumps({
@@ -228,6 +249,9 @@ def main():
     # latency numbers (the deck's "A is the latency shape") were gathered cold while the
     # throughput numbers were gathered warm.
     # Correctness BEFORE speed. A garbage engine must not produce a clean-looking column.
+    print(describe_call(url, {"model": args.model,
+                              "messages": [{"role": "user", "content": SANITY_Q}],
+                              "max_tokens": 16, "temperature": 0.0}), flush=True)
     ok, answer = sanity(url, args.model)
     print(f"sanity: {SANITY_Q!r} -> {answer!r} [{'PASS' if ok else 'FAIL'}]", flush=True)
     if not ok:
@@ -246,6 +270,10 @@ def main():
         print("skipping the single-stream pass (--runs 0)", flush=True)
         single = {"runs": 0}
 
+    print(describe_call(urls[0], {"model": args.model,
+                                  "messages": [{"role": "user", "content": PROMPT}],
+                                  "max_tokens": args.max_tokens, "temperature": 1.0,
+                                  "stream": True}), flush=True)
     print(f"loaded pass (concurrency {args.concurrency} across {len(urls)} "
           f"endpoint(s): {ports}) max_tokens={args.max_tokens}", flush=True)
     loaded = pass_loaded(urls, args.model, args.max_tokens, args.concurrency)
