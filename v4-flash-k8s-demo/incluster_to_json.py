@@ -36,7 +36,9 @@ def grab(pattern, cast=float):
 # not get a correct answer to 2+2, every timing in this file describes garbage.
 m = re.search(r"sanity: .* -> (.*) \[(PASS|FAIL)\]", log)
 sane = (m.group(2) == "PASS") if m else None
-sane_answer = m.group(1) if m else None
+# bench.py prints the answer with !r, so the captured group arrives already quoted;
+# storing "'4'" would put nested quotes in the JSON and on the comparison table.
+sane_answer = m.group(1).strip().strip("'\"") if m else None
 
 out = {
     "name": name,

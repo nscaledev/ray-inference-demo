@@ -1,3 +1,20 @@
+# ============================================================================================
+# DO NOT USE THIS FILE. It silently produces GARBAGE. Use 10b-strategy-tep8-deployment.yaml.
+#
+# These exact flags (15/15, diffed semantically) are correct when run as a Deployment with
+# vLLM's own local Ray -- that is 10b, and strategy D uses the same arrangement. Run as a
+# RayJob against the shared RayCluster head, the same engine answers:
+#
+#   Q: "What is 2+2? Reply with only the number."
+#   A: ", however remark Truckitàlee 2/unitsiwaite佛 $K习题 above..."
+#
+# ...at 2,294.8 tok/s with zero failed requests. Reproduced twice, the second time on a head
+# verified empty (GPU-holding pods: 0), so it is not leftover state from a previous strategy.
+#
+# Strategy B (DP8 x EP) is CORRECT as a RayJob on that same shared head, so the fault is not
+# the head and not TP8 -- it is TP8 driven through a shared RayCluster. Kept as the finding.
+# ============================================================================================
+#
 # 10 — STRATEGY A: TEP8 (tensor + expert parallel, one 8x B200 machine)
 # The latency shape: attention sliced 8 ways over NVLink, whole experts per GPU.
 #

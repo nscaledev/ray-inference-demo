@@ -1,0 +1,243 @@
+# 10b — STRATEGY A, as a Deployment. USE THIS ONE, NOT 10-.
+#
+# 10-strategy-tep8.yaml runs the identical engine flags as a RayJob on the shared RayCluster
+# head, and on this stack that engine SILENTLY PRODUCES GARBAGE:
+#
+#   Q: "What is 2+2? Reply with only the number."
+#   A: ", however remark Truckit\u00e0lee 2/unitsiwaite\u4f5b $K\u4e60\u9898 above..."
+#   Q: "What is the capital of France? One word."
+#   A: "Barton'set \u201c \u201cCho\u2014 lan =singget, \"ifequorum \u2014\u2014..."
+#
+# ...while reporting 2,294.8 tok/s with zero failed requests. Reproduced twice, the second time
+# on a head verified empty (`GPU-holding pods: 0`), so it is not stale state from a previous
+# strategy. The flags here are BYTE-IDENTICAL to 10-'s (diffed); the only difference is
+# orchestration: this runs as a Deployment where vLLM starts its own local Ray inside the pod,
+# which is the same arrangement strategy D uses and which is verified correct by reading its
+# answers. B (DP8xEP) is correct as a RayJob on that same shared head, so the suspect is
+# specifically TP8-via-the-shared-RayCluster rather than TP8 itself.
+#
+# Still Ray either way: --distributed-executor-backend ray drives the 8 GPUs in both cases.
+# What changed is who owns the Ray cluster, not whether Ray is in the path.
+#
+# 40 — STRATEGY D: scale OUT with whole replicas
+# Same single-machine engine (strategy B's shape), more machines, one Service.
+#
+# REPLICATES THE WINNER. Each pod runs strategy A's shape (TEP8), not B's. Replication
+# multiplies whatever you put in it — measured close to linear per machine — so replicating
+# the slower shape produced less across two machines than one machine of A produced alone.
+# Scale out the shape that won; that is the whole lesson of the measured slide.
+# Current numbers: `just compare` (and `just stability` for the spread) — they are NOT
+# hardcoded here, because every absolute figure in this repo went stale twice in one day.
+#
+# ON LOSING REQUESTS WHEN A REPLICA DIES — three layers, in order of what they buy:
+#   1. Graceful drain (below): fixes PLANNED disruptions — deploys, node drains, a
+#      deliberate delete. In-flight requests finish; new ones go to the survivor.
+#   2. A retrying router in front (see 40b-replicas-router.yaml): fixes failures that
+#      happen BEFORE the first token — a dead pod still in rotation, a 5xx. vllm-router
+#      retries 5x with backoff and circuit-breaks the bad worker, by default.
+#      A bare Service cannot do this; it has no notion of a failed request.
+#   3. Client retry: the only cure for a hard kill MID-stream. Once a 200 and some
+#      tokens are on the wire, no proxy can resume the response — plan for it.
+# Throughput multiplies with ZERO model traffic between machines — each request
+# lands on exactly one replica. This is the scale-out shape when the model fits
+# a single machine.
+#
+# RAY-NATIVE, deliberately per-replica: each pod runs its own Ray (vLLM starts a
+# local instance when it can't find one) and drives its 8 GPUs through
+# --distributed-executor-backend ray + --data-parallel-backend ray. That keeps
+# every replica's actors inside one machine's NVLink domain by construction.
+#
+# The alternative — one 16-GPU RayCluster with two RayJobs — puts both replicas in
+# a single Ray dashboard, but then Ray's placement decides which machine each
+# engine's 8 actors land on, and a group that straddles the two machines would do
+# its expert routing over the 200G Ethernet instead of NVLink. Per-replica Ray
+# trades one dashboard for a guarantee about where the traffic stays.
+#
+# GPU math on this 3-machine cluster (24 GPUs): each replica takes a full 8x B200 node, so
+# D wants 16 and C wants 8 — they COEXIST, which is the whole point of `just stage-up`.
+# Do NOT delete C to make room for D; that was the 2-machine instruction and it tears down
+# exactly what the demo configuration builds. What does not fit is all four at once
+# (A 8 + B 8 + C 8 + D 16 = 40), so A and B are measured separately.
+#
+#   kubectl apply -f 40-strategy-replicas.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: v4-flash-tep8
+  namespace: v4-flash-demo
+spec:
+  replicas: 1                      # ONE machine — this IS strategy A
+  # Recreate, not RollingUpdate: each pod holds a whole machine's 8 GPUs, so a
+  # rolling update deadlocks — the new ReplicaSet can't schedule until the old
+  # one lets go, and the old one won't until the new one is Ready (which takes a
+  # ~20 min engine start). Recreate tears down first, which is what you want.
+  # The default progressDeadlineSeconds is 600, and this engine takes ~20 min to become
+  # Ready (weights, DeepGEMM JIT, FlashInfer autotune). Without this, the Deployment trips
+  # ProgressDeadlineExceeded at 600s and `kubectl rollout status --timeout=45m` returns
+  # FAILURE on a perfectly healthy pod — the longer client timeout cannot help, because the
+  # deadline is server-side. 50-longctx-1m.yaml hit this first; the same start applies here.
+  progressDeadlineSeconds: 2400
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: v4-flash-tep8 } }
+  template:
+    metadata: { labels: { app: v4-flash-tep8 } }
+    spec:
+      nodeSelector:
+        nvidia.com/gpu.product: "NVIDIA-B200"   # <-- adjust to your GFD labels
+      affinity:
+        podAntiAffinity:            # exactly one replica per machine
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: { app: v4-flash-tep8 }
+              topologyKey: kubernetes.io/hostname
+      # Graceful drain. Measured the hard way: a 2048-token generation takes ~91 s, the
+      # default grace period is 30 s, so `kubectl delete pod` SIGKILLed mid-stream and
+      # 31 of 64 in-flight requests died. On SIGTERM Kubernetes removes the pod from
+      # Service endpoints immediately (new requests go to the survivor) while these two
+      # settings let the in-flight ones finish: the preStop sleep covers endpoint
+      # propagation, and the grace period must exceed your longest generation.
+      terminationGracePeriodSeconds: 300
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.27.1
+          command: ["bash", "-lc"]
+          args:
+            - |
+              exec vllm serve /models/DeepSeek-V4-Flash-0731 \
+                --served-model-name deepseek-ai/DeepSeek-V4-Flash-0731 \
+                --distributed-executor-backend ray \
+                --tensor-parallel-size 8 \
+                --enable-expert-parallel \
+                --trust-remote-code \
+                --kv-cache-dtype fp8 --block-size 256 \
+                --attention-config '{"use_fp4_indexer_cache":true}' \
+                --tokenizer-mode deepseek_v4 \
+                --tool-call-parser deepseek_v4 --enable-auto-tool-choice \
+                --reasoning-parser deepseek_v4 \
+                --max-model-len 262144 \
+                --host 0.0.0.0 --port 8000
+          env:
+            - { name: HF_HOME, value: /models/hf-cache }
+            # These replicas use the Ray executor too, and this image ships no ray —
+            # without the overlay on PYTHONPATH vLLM dies at config time with
+            # "Failed to import Ray: No module named 'ray'". 02 staged it on the PVC.
+            - { name: PYTHONPATH, value: /models/ray-site }
+            # See 03: keeps the ~10 min autotune out of every restart of this shape.
+            - { name: VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR, value: /root/.cache/flashinfer }
+            - { name: PATH, value: "/models/ray-site/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "10"]     # let endpoint removal propagate first
+          ports: [{ containerPort: 8000 }]
+          # STARTUP GATE: Ready must mean "has generated", not "has bound a port".
+          #
+          # Measured on this cluster, the startup order is:
+          #   08:10:01  FlashInfer autotune begins (trtllm_fp4_block_scale_moe, 10 profiles)
+          #   08:18:26  autotune done - 8m19s
+          #   08:19:05  CUDA graph capture done
+          #   08:19:09  "Application startup complete"  <- first traffic accepted
+          # So autotune and graph capture ALREADY gate the endpoint; there is nothing to force.
+          #
+          # What is NOT gated is per-shape TileLang JIT, which fires on the first request of a
+          # shape the engine has not seen -- vLLM logs "TileLang JIT compilation during
+          # inference ... consider extending warmup to cover this shape/config". A pod that
+          # passes /health can therefore still be minutes from serving at speed, and while it
+          # sits in the Service's endpoints it takes real traffic cold: measured ~400 tok/s
+          # against a warm replica's ~2300.
+          #
+          # A startupProbe that GENERATES fixes that where it belongs. Until one real completion
+          # succeeds the container is not Ready, so it is absent from the Service and cannot be
+          # sent traffic. readinessProbe does not even run until this passes, so this costs one
+          # request, not one per period.
+          startupProbe:
+            exec:
+              command:
+                - bash
+                - -lc
+                - >-
+                  curl -sf -m 90 localhost:8000/v1/chat/completions
+                  -H 'content-type: application/json'
+                  -d '{"model":"deepseek-ai/DeepSeek-V4-Flash-0731","messages":[{"role":"user","content":"ping"}],"max_tokens":1}'
+                  | grep -q '"choices"'
+            periodSeconds: 15
+            # 15s x 120 = 30 min, comfortably past the ~20 min cold start. Too small a budget
+            # here is the same false-alarm class as the 600s progressDeadlineSeconds default.
+            failureThreshold: 120
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 10
+          resources:
+            requests: { nvidia.com/gpu: "8", cpu: "64", memory: 512Gi }
+            limits:   { nvidia.com/gpu: "8", memory: 900Gi }
+          volumeMounts:
+            - { name: models, mountPath: /models, readOnly: true }
+            - { name: dshm, mountPath: /dev/shm }
+            - { name: jit-cache, mountPath: /root/.cache }
+            - { name: tilelang-cache, mountPath: /root/.tilelang }   # keeps the ~12 min DeepGEMM warmup across restarts
+      volumes:
+        - name: models
+          persistentVolumeClaim: { claimName: v4-flash-models, readOnly: true }
+        - name: dshm
+          emptyDir: { medium: Memory, sizeLimit: 256Gi }
+        - name: jit-cache
+          hostPath: { path: /var/lib/v4-flash/vllm-cache, type: DirectoryOrCreate }
+        - name: tilelang-cache
+          hostPath: { path: /var/lib/v4-flash/tilelang-cache, type: DirectoryOrCreate }
+---
+# Node drains and cluster upgrades are "voluntary" disruptions; without this, both
+# replicas can be evicted at once and the Service has no endpoints at all.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: v4-flash-tep8
+  namespace: v4-flash-demo
+spec:
+  minAvailable: 1
+  selector: { matchLabels: { app: v4-flash-tep8 } }
+---
+# One endpoint, N machines — requests round-robin across replicas.
+apiVersion: v1
+kind: Service
+metadata:
+  name: v4-flash-tep8
+  namespace: v4-flash-demo
+spec:
+  selector: { app: v4-flash-tep8 }
+  ports: [{ port: 8000, targetPort: 8000 }]
+---
+# HOW TO RUN + MEASURE THIS STRATEGY
+#
+# One command — tears down the previous strategy first (measuring one at a time is what
+# makes the columns comparable; 24 GPUs do allow C+D together, see `just stage-up`),
+# applies this one, waits for the engine, measures, and leaves it serving:
+#
+#   just run-d
+#
+# Or by hand:
+#   kubectl delete -f 30-strategy-pd-single-node.yaml   # C's RayJobs + router
+#   kubectl -n v4-flash-demo delete raycluster v4-flash    # frees the head's 8 GPUs
+#   kubectl apply -f 40-strategy-replicas.yaml
+#   just bench-d                 # writes metrics/D-replicas.json
+#   just probe-d                 # each replica measured ALONE — do this before quoting bench-d
+#   just compare
+#
+# What scaling measured: see `just compare` — the numbers are not copied here, because
+# every absolute figure in this repo went stale twice in one day. The SHAPE of the result is
+# the durable part: two replicas of A deliver close to 2x one replica of A at the same
+# offered load per replica, with single-stream latency unchanged. Scale-out buys capacity,
+# never per-request speed.
+#
+# MEASURE EACH REPLICA ALONE FIRST (`just probe-d`). A Service-level aggregate cannot tell
+# you one replica is cold, and that produced three wrong diagnoses here: the port-forward,
+# then "cold kernels", then "one pod is permanently sick". The real cause was that bench.py
+# warmed a 64-token shape and then measured a 256-token one, leaving the measured path cold
+# on whichever replica had been idle. Warmup now matches the measured shape.
+#
+# What does not need measuring, because it is structural:
+#   - a request already streaming from the killed pod cannot be rescued by anything in
+#     the infrastructure — the client must retry (see the header's three layers)
+#   - the graceful-drain settings above only help a PLANNED delete: SIGTERM removes the
+#     pod from endpoints and in-flight generations get up to 300 s to finish
+#   - the replacement pod needs a full engine start (~15-20 min on a cold node) before it
+#     carries traffic again, so pre-warm every machine in the pool

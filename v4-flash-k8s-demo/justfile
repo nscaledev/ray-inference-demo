@@ -210,7 +210,7 @@ _ask-strategy label want svc port prompt temp="1.0":
 
 [doc("Ask strategy A and show the exchange (refuses unless A is serving)")]
 ask-a prompt="In one sentence: why keep expert routing inside the NVLink domain?":
-    @just _ask-strategy "A · TEP8 (TP8 + EP)" serve-tep8 v4-flash-openai 8000 "{{prompt}}"
+    @just _ask-strategy "A · TEP8 (TP8 + EP, Deployment)" deploy/v4-flash-tep8 v4-flash-tep8 8000 "{{prompt}}"
 
 [doc("Ask strategy B and show the exchange (refuses unless B is serving)")]
 ask-b prompt="In one sentence: what does speculative decoding change about decode?":
@@ -267,8 +267,10 @@ teardown:
     -@kubectl delete -f 30b-pd-proxy-fallback.yaml --ignore-not-found 2>/dev/null
     -@kubectl delete -f 40-strategy-replicas.yaml --ignore-not-found 2>/dev/null
     -@kubectl delete -f 40b-replicas-router.yaml --ignore-not-found 2>/dev/null
+    -@kubectl delete -f 10b-strategy-tep8-deployment.yaml --ignore-not-found 2>/dev/null
     -@kubectl delete -f 50-longctx-1m.yaml --ignore-not-found 2>/dev/null
     @just _wait-gpus-free "1"
+    @just _wait-head-idle
 
 # Also delete the RayCluster — needed before strategy D, whose two replicas want
 # both machines (the Ray head holds 8 GPUs of its own; see 03).
@@ -296,6 +298,37 @@ _ensure-cluster:
     echo "RayCluster did not become ready"; kubectl -n {{ns}} get pods; exit 1
 
 # Wait until at most `keep` GPU-holding pods remain in the namespace.
+# Wait until the Ray head has NO engine processes left, not merely until GPU-holding pods
+# have gone. This is the gap that let a RayJob start on a dirty head:
+#
+#   `teardown` deletes the RayJob and _wait-gpus-free returns as soon as GPU-holding PODS drop
+#   to 1 -- but the head IS that one pod, and its previous engine's actors keep running inside
+#   it for tens of seconds after the RayJob object disappears. Evidence, all from this cluster:
+#     - probe-tp4 died with "Free memory on device cuda:7 (58.5/178.35 GiB) on startup is less
+#       than desired GPU memory utilization" while the prior engine still held it
+#     - a restarted P/D prefill pool died with zmq "Address already in use" on the previous
+#       run's coordinator port
+#     - strategy A, applied 0s after B-without-DSpark was torn down, came up in 185s, generated
+#       tokens, and FAILED the 2+2 check with 'gpackage: "github.com/aws/aws-sdk-go/...'
+#   The first two announce themselves. The third does not, which is the dangerous one.
+_wait-head-idle budget="60":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    h=$(kubectl -n {{ns}} get pod -l ray.io/node-type=head --field-selector=status.phase=Running -o name 2>/dev/null | head -1 | cut -d/ -f2)
+    [ -z "$h" ] && exit 0
+    for i in $(seq 1 {{budget}}); do
+      n=$(kubectl -n {{ns}} exec "$h" -- bash -c 'ps -eo cmd 2>/dev/null | grep -E "vllm serve|EngineCoreActor" | grep -v grep | wc -l' 2>/dev/null | tr -d ' ')
+      if [ "${n:-1}" = "0" ]; then
+        [ "$i" -gt 1 ] && echo "head idle after ~$((i * 10))s (previous engine released its GPUs)"
+        exit 0
+      fi
+      sleep 10
+    done
+    echo "WARNING: the head still has engine processes after $(( {{budget}} * 10 ))s."
+    echo "Starting a strategy now risks a silently-corrupt engine — see _wait-head-idle."
+    exit 1
+
+
 _wait-gpus-free keep:
     #!/usr/bin/env bash
     set -uo pipefail
@@ -338,8 +371,14 @@ _wait-gpus-free keep:
 # D's aggregate is therefore NOT quotable until every replica measures the same alone.
 
 [doc("A · TEP8: teardown, apply, wait, measure, leave it serving")]
-run-a: teardown _ensure-cluster && bench-a
-    kubectl apply -f 10-strategy-tep8.yaml
+run-a: teardown && bench-a
+    # 10b, NOT 10-. Identical engine flags (15/15, diffed), but 10- runs them as a RayJob on the
+    # shared RayCluster head and that engine silently emits garbage -- "What is 2+2?" answered
+    # with multilingual word salad at 2,294.8 tok/s, reproduced twice, the second time on a head
+    # verified empty. 10b runs the same flags as a Deployment with vLLM's own local Ray, which
+    # is what strategy D uses and which answers correctly. B (DP8xEP) is fine as a RayJob on
+    # that same head, so the fault is TP8-through-a-shared-RayCluster specifically.
+    kubectl apply -f 10b-strategy-tep8-deployment.yaml
 
 [doc("B · DP8xEP + MegaMoE + DSpark, the published reference shape")]
 run-b: teardown _ensure-cluster && bench-b
@@ -371,7 +410,7 @@ run-all:
 
 # A · TEP8 — the latency shape.
 [doc("Measure A (assumes it is already serving)")]
-bench-a: (_bench "A-tep8" "TEP8 (RayJob)" "latency shape: attention sliced 8 ways over NVLink, whole experts per GPU" "v4-flash-openai" "32")
+bench-a: (_bench "A-tep8" "TEP8 (Deployment, own Ray)" "latency shape: attention sliced 8 ways inside the NVLink domain, whole experts per GPU" "v4-flash-tep8" "32")
 
 # B · DP8 x EP (+ MegaMoE, + DSpark) — the published reference shape.
 [doc("Measure B")]
@@ -447,6 +486,7 @@ bench-d-router:
 #   3. no wait ends silently — Complete, Failed and timeout all print and set exit status
 #   4. nothing writes metrics/*.json unless the Job actually reached Complete
 #   5. a fleet aggregate is not believed until each backend has been measured ALONE
+#   6. one bench Job at a time — a second must refuse, never take over the name
 # =============================================================================
 
 # INVARIANT 5. Measure every replica on its own, bypassing the Service.
@@ -501,6 +541,20 @@ _bench name label claim svc concurrency:
 _bench_start name label claim svc concurrency runs max_tokens="256":
     #!/usr/bin/env bash
     set -uo pipefail
+    # INVARIANT 7: one bench at a time, and a second one must SHOUT rather than take over.
+    # This unconditionally deleted any existing Job and replaced it, so two concurrent runs
+    # silently fought over the name and the loser's result was written under the winner's
+    # label. That happened twice: two `bench-d` invocations at once, and later a stale
+    # verification script firing `bench-b` while a re-measure sequence had already moved on to
+    # B-without-DSpark -- which would have recorded B-nospec's throughput as B's, the exact
+    # number the talk's headline rests on. Refuse instead.
+    active=$(kubectl -n {{ns}} get job bench-in-cluster -o jsonpath='{.status.active}' 2>/dev/null || true)
+    if [ "${active:-0}" -ge 1 ] 2>/dev/null; then
+      echo "REFUSING: a bench Job is already running in {{ns}}. Two concurrent benches"
+      echo "contaminate each other and write under each other's labels. Wait for it, or:"
+      echo "    kubectl -n {{ns}} delete job bench-in-cluster"
+      exit 1
+    fi
     kubectl -n {{ns}} delete job bench-in-cluster --ignore-not-found >/dev/null 2>&1
     sleep 3
     kubectl -n {{ns}} create configmap bench-src --from-file=bench.py=bench.py \
@@ -535,6 +589,9 @@ _bench_finish name svc concurrency runs="3" label="" claim="":
     #!/usr/bin/env bash
     set -uo pipefail
     just _job-wait bench-in-cluster || { echo "not writing metrics/{{name}}.json"; exit 1; }
+    # The sanity verdict is printed BEFORE the timings, so `tail -5` hid the one line that
+    # says whether the timings mean anything. Surface it explicitly.
+    kubectl -n {{ns}} logs job/bench-in-cluster | grep -E '^sanity:|OUTPUT IS NOT SANE' || true
     kubectl -n {{ns}} logs job/bench-in-cluster | tail -5
     kv=$(just _kv-tokens "{{name}}")
     mkdir -p metrics
