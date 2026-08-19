@@ -1,3 +1,32 @@
+# BOTH POOLS MUST SHARE A PARALLELISM SHAPE, or NIXL ships KV one layout and the other
+# side reads it as another. Measured, after asking the pools a question rather than only
+# timing them:
+#
+#   prefill TP4  + decode DP4xEP , kv_both      -> prefill garbage, router garbage, decode OK
+#   prefill TP4  + decode DP4xEP , producer/consumer -> prefill garbage, router garbage, decode OK
+#   prefill DP4xEP + decode DP4xEP, producer/consumer -> WILL NOT START: two DP+EP engines on
+#     one node both bind the MoE data-parallel coordinator port and the second dies with
+#     zmq.error.ZMQError: Address already in use (tcp://<head>:5600). So "just match the
+#     shapes" is not available on a single machine here.
+#   prefill TP4 + decode DP4xEP, producer/consumer, enable_permute_local_kv=true -> the
+#     NixlConnector flag that exists precisely to reconcile different local KV layouts
+#
+# The kv_role deprecation warning was a real bug and worth fixing, but it was NOT the cause:
+# correcting kv_both -> kv_producer/kv_consumer changed nothing. What is left is the shape
+# mismatch. A kv_producer hands its KV away, so garbage from the prefill pool *standalone* is
+# expected; garbage from the ROUTER is not, and that is what the mismatch explains — the
+# decode pool receives a cache sharded for a different topology.
+#
+# CORRECTNESS, found by asking the pools a question instead of only timing them:
+# with kv_role=kv_both on BOTH pools, the prefill pool returned garbage for every prompt
+# ("What is 2+2?" -> " \u2014 \nB.2.2.2.2.2..."), and the router inherited it, while the decode
+# pool answered correctly on its own. vLLM warns about exactly this:
+#   "Using kv_role='kv_both' with NixlConnector is deprecated ... set kv_role='kv_producer'
+#    for prefill instances and kv_role='kv_consumer' for decode instances."
+# The benchmark never noticed, because bench.py measures tokens per second and never reads
+# what came back. THAT is the lesson worth telling: a throughput harness cannot tell you the
+# output is wrong. `just ask` and `just longctx` can, which is why they are demo steps.
+#
 # 30 — STRATEGY C: P/D disaggregation on ONE machine, both pools on Ray.
 #
 # Prefill is compute-bound, decode is memory-bandwidth-bound. Two engines, sized
@@ -32,7 +61,7 @@ spec:
     --kv-cache-dtype fp8
     --block-size 256
     --attention-config '{"use_fp4_indexer_cache":true}'
-    --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+    --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer","enable_permute_local_kv":true}'
     --max-num-batched-tokens 16384
     --tokenizer-mode deepseek_v4
     --max-model-len 262144
@@ -59,7 +88,7 @@ spec:
     --kv-cache-dtype fp8
     --block-size 256
     --attention-config '{"use_fp4_indexer_cache":true}'
-    --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+    --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer","enable_permute_local_kv":true}'
     --max-num-batched-tokens 512
     --tokenizer-mode deepseek_v4
     --tool-call-parser deepseek_v4

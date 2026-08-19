@@ -50,6 +50,12 @@ spec:
   # rolling update deadlocks — the new ReplicaSet can't schedule until the old
   # one lets go, and the old one won't until the new one is Ready (which takes a
   # ~20 min engine start). Recreate tears down first, which is what you want.
+  # The default progressDeadlineSeconds is 600, and this engine takes ~20 min to become
+  # Ready (weights, DeepGEMM JIT, FlashInfer autotune). Without this, the Deployment trips
+  # ProgressDeadlineExceeded at 600s and `kubectl rollout status --timeout=45m` returns
+  # FAILURE on a perfectly healthy pod — the longer client timeout cannot help, because the
+  # deadline is server-side. 50-longctx-1m.yaml hit this first; the same start applies here.
+  progressDeadlineSeconds: 2400
   strategy: { type: Recreate }
   selector: { matchLabels: { app: v4-flash-replica } }
   template:

@@ -40,6 +40,8 @@ FIELDS = [
     ("endpoints",           lambda d: d["under_load"].get("endpoints", 1), ""),
     ("KV cache (tokens)",   lambda d: f'{d["kv_cache_tokens"]:,}' if d.get("kv_cache_tokens") else None, ""),
     ("failed requests",     lambda d: d["under_load"]["failed"], ""),
+    # Last row on purpose: it is the one that invalidates every row above it.
+    ("output sane (2+2)",   lambda d: {True: "yes", False: "NO — GARBAGE", None: "—"}[d.get("output_sane")], ""),
 ]
 
 
@@ -121,6 +123,15 @@ def main():
         print(f"\n⚠ columns were measured at different concurrency ({', '.join(sorted(concs))}). "
               "Aggregate tok/s is only comparable at equal offered load per engine — for a "
               "multi-replica strategy that means 32 per replica, not 32 in total.")
+    bad = [s for s, _ in cols if data[s].get("output_sane") is False]
+    if bad:
+        print(f"\n⛔ {', '.join(bad)} FAILED the output-sanity check: the engine answered 2+2 "
+              "wrongly, so its throughput is the throughput of garbage. Do not quote it. This "
+              "happened for real — a P/D prefill pool with kv_role=kv_both returned 200s full "
+              "of nonsense while this table showed it at 1,703.9 tok/s.")
+    unknown = [s for s, _ in cols if data[s].get("output_sane") is None]
+    if unknown:
+        print(f"\n⚠ {', '.join(unknown)} predate the sanity check — re-measure before quoting.")
     print("⚠ compare within one image only: the same manifest on two vLLM builds gave a "
           "45x different KV budget and ~20x different throughput.")
 

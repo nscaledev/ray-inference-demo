@@ -145,7 +145,12 @@ def main():
           f"needle {'FOUND' if found else 'MISSED'}{ratio}")
     if not found:
         print(f"    answered: {answer.strip()[:160]!r}")
-    return 0 if found else 1
+    # A MISSED needle is a RESULT, not a harness failure. With backoffLimit: 0 a non-zero exit
+    # marks the Job Failed, so `_job-wait` printed "FAILED" and dumped 25 log lines for a test
+    # that ran perfectly — and a miss at depth 0.50 is the single most interesting outcome this
+    # harness can produce about the CSA claim. Only the codes above (2 rejected, 3 no content,
+    # 4 unreachable) mean the measurement itself did not happen.
+    return 0
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ default:
 # --- state ------------------------------------------------------------------
 
 # Cluster, GPUs, Ray, and which model (if any) is being served right now.
+[doc("What the cluster is running right now: GPUs, Ray, and which endpoints serve")]
 state:
     @echo "=== nodes / GPUs ==="
     @kubectl get nodes -o custom-columns='NAME:.metadata.name,TYPE:.metadata.labels.node\.kubernetes\.io/instance-type,GPU:.status.allocatable.nvidia\.com/gpu'
@@ -37,22 +38,55 @@ state:
     @echo "=== weights on the shared PVC ==="
     @kubectl -n {{ns}} get pvc v4-flash-models --no-headers 2>/dev/null || echo "  no PVC"
     @echo
-    @echo "=== served models (expect NONE before a strategy is applied) ==="
+    @echo "=== endpoints actually answering /v1/models ==="
     @-just _models
+
+# Which endpoints are actually answering, probed from INSIDE the cluster.
+#
+# This exists because `just state` used to port-forward ONE hardcoded Service
+# (v4-flash-openai:8000) and, finding nothing there, print "nothing is serving" — while
+# strategy C was serving on pd-router:8000 and the 1M engine on v4-flash-longctx:8000. On
+# demo day both are deliberately pre-started, so the cold open asserted the opposite of the
+# truth. `just ask` shared the same wrong default and died with a JSONDecodeError traceback.
+#
+# Probing from a vLLM pod (its image ships curl and it resolves every Service by DNS) means
+# no tunnels and no guessing. If no vLLM pod exists then nothing is serving, and saying so
+# is correct rather than a fallback.
+_endpoints:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    probe=""
+    for sel in "ray.io/node-type=head" "app=v4-flash-longctx" "app=v4-flash-replica"; do
+      probe=$(kubectl -n {{ns}} get pods -l "$sel" --field-selector=status.phase=Running \
+              -o name 2>/dev/null | head -1 | cut -d/ -f2)
+      [ -n "$probe" ] && break
+    done
+    [ -z "$probe" ] && exit 0
+    for target in v4-flash-openai:8000 pd-router:8000 pd-pools:8100 pd-pools:8200 \
+                  v4-flash-replicas:8000 v4-flash-longctx:8000; do
+      svc=${target%%:*}; port=${target##*:}
+      if kubectl -n {{ns}} exec "$probe" -- curl -sf -m 4 \
+           "http://$svc:$port/v1/models" >/dev/null 2>&1; then
+        echo "$svc $port"
+      fi
+    done
+
 
 _models:
     #!/usr/bin/env bash
     set -uo pipefail
-    kubectl -n {{ns}} port-forward svc/v4-flash-openai 8000:8000 >/dev/null 2>&1 &
-    pf=$!; disown $pf 2>/dev/null || true; sleep 2
-    out=$(curl -sf -m 4 localhost:8000/v1/models 2>/dev/null || true)
-    kill $pf 2>/dev/null || true
-    if [ -z "$out" ]; then echo "  no OpenAI endpoint answering — nothing is serving"; else
-      echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("\n".join("  serving: "+m["id"] for m in d.get("data",[])) or "  endpoint up, no models")'
+    found=$(just _endpoints)
+    if [ -z "$found" ]; then
+      echo "  nothing is serving"
+    else
+      echo "$found" | while read -r svc port; do
+        echo "  serving: svc/$svc:$port"
+      done
     fi
 
 # Is the endpoint answering yet? (see the LIFECYCLE block near _bench for why these
 # three recipes are written together)
+[doc("Poll an endpoint until it answers /v1/models")]
 wait-ready port="8000" svc="v4-flash-openai" budget="540":
     #!/usr/bin/env bash
     set -uo pipefail
@@ -81,6 +115,7 @@ wait-ready port="8000" svc="v4-flash-openai" budget="540":
     exit 1
 
 # Ray dashboard — placement groups, actors, GPU assignment. Blocks; Ctrl-C to stop.
+[doc("Ray dashboard on :8265 (blocks; Ctrl-C to stop)")]
 dashboard port="8265":
     #!/usr/bin/env bash
     set -uo pipefail
@@ -89,6 +124,7 @@ dashboard port="8265":
     exec kubectl -n {{ns}} port-forward svc/v4-flash-openai {{port}}:8265
 
 # Per-GPU utilisation and memory, from inside whichever pod holds the GPUs.
+[doc("Per-GPU utilisation and memory, from inside the pods holding them")]
 gpus:
     #!/usr/bin/env bash
     set -uo pipefail
@@ -102,23 +138,35 @@ gpus:
     done
 
 # Same, refreshed — this is what makes two P/D pools visible during strategy C.
+[doc("Same as gpus, refreshed — shows C's two pools lighting up separately")]
 watch-gpus interval="2":
     #!/usr/bin/env bash
     set -uo pipefail
     while true; do clear; date +%T; just gpus; sleep {{interval}}; done
 
 # Ask the live endpoint one question (whichever strategy is serving).
-ask prompt="One sentence: why keep expert routing on NVLink?" svc="v4-flash-openai" port="8000":
+[doc("Ask whichever endpoint is serving one question, and print the answer")]
+ask prompt="One sentence: why keep expert routing on NVLink?" svc="" port="8000":
     #!/usr/bin/env bash
     set -uo pipefail
-    kubectl -n {{ns}} port-forward svc/{{svc}} {{port}}:8000 >/dev/null 2>&1 &
-    pf=$!; disown $pf 2>/dev/null || true; trap "kill $pf 2>/dev/null" EXIT
-    sleep 3
-    curl -s -m 300 localhost:{{port}}/v1/chat/completions -H 'content-type: application/json' \
-      -d "$(python3 -c 'import json,sys; print(json.dumps({"model":"{{model}}","messages":[{"role":"user","content":sys.argv[1]}],"max_tokens":200}))' "{{prompt}}")" \
-      | python3 -c 'import json,sys; d=json.load(sys.stdin); m=d["choices"][0]["message"]; print((m.get("content") or m.get("reasoning_content") or "").strip()); print("--", d["usage"])'
+    # svc="" means "whatever is serving". The old default was a hardcoded Service that is
+    # empty during strategy C, so this beat crashed with a JSONDecodeError traceback on stage.
+    svc="{{svc}}"; port="{{port}}"
+    if [ -z "$svc" ]; then
+      pick=$(just _endpoints | grep -vE "^pd-pools " | head -1)
+      [ -z "$pick" ] && { echo "nothing is serving — bring a strategy up first"; exit 1; }
+      svc=${pick%% *}; port=${pick##* }
+      echo "(asking svc/$svc:$port)"
+    fi
+    probe=$(kubectl -n {{ns}} get pods -l ray.io/node-type=head --field-selector=status.phase=Running -o name 2>/dev/null | head -1 | cut -d/ -f2)
+    [ -z "$probe" ] && probe=$(kubectl -n {{ns}} get pods -l app=v4-flash-longctx --field-selector=status.phase=Running -o name 2>/dev/null | head -1 | cut -d/ -f2)
+    [ -z "$probe" ] && { echo "no vLLM pod to ask from"; exit 1; }
+    body=$(python3 make_request.py "{{model}}" "{{prompt}}")
+    kubectl -n {{ns}} exec "$probe" -- curl -s -m 300 "http://$svc:$port/v1/chat/completions" -H 'content-type: application/json' -d "$body" > /tmp/just-ask.json 2>/dev/null
+    python3 show_answer.py /tmp/just-ask.json
 
 # Driver log of the running RayJob (strategies A, B and C).
+[doc("Follow the running RayJob's driver log")]
 logs:
     #!/usr/bin/env bash
     set -uo pipefail
@@ -132,6 +180,7 @@ logs:
 # deliberately runs C and D together for the demo. Call these directly to free hardware.
 
 # Remove whatever strategy is serving. Keeps the RayCluster, the PVC and the weights.
+[doc("Remove whatever strategy is serving; keep the RayCluster, PVC and weights")]
 teardown:
     -@kubectl -n {{ns}} delete rayjob --all --ignore-not-found 2>/dev/null
     -@kubectl delete -f 30-strategy-pd-single-node.yaml --ignore-not-found 2>/dev/null
@@ -143,6 +192,7 @@ teardown:
 
 # Also delete the RayCluster — needed before strategy D, whose two replicas want
 # both machines (the Ray head holds 8 GPUs of its own; see 03).
+[doc("teardown, and drop the RayCluster too (frees the head's 8 GPUs)")]
 teardown-cluster: teardown
     -@kubectl delete -f 03-raycluster.yaml --ignore-not-found 2>/dev/null
     @just _wait-gpus-free "0"
@@ -207,15 +257,19 @@ _wait-gpus-free keep:
 # one backend is sick. Measure each replica alone before believing a fleet aggregate.
 # D's aggregate is therefore NOT quotable until every replica measures the same alone.
 
+[doc("A · TEP8: teardown, apply, wait, measure, leave it serving")]
 run-a: teardown _ensure-cluster && bench-a
     kubectl apply -f 10-strategy-tep8.yaml
 
+[doc("B · DP8xEP + MegaMoE + DSpark, the published reference shape")]
 run-b: teardown _ensure-cluster && bench-b
     kubectl apply -f 20-strategy-dp8-ep.yaml
 
+[doc("C · P/D disaggregation on one machine, via vllm-router")]
 run-c: teardown _ensure-cluster && bench-c
     kubectl apply -f 30-strategy-pd-single-node.yaml
 
+[doc("D · whole replicas across machines behind one Service")]
 run-d: teardown-cluster && bench-d
     kubectl apply -f 40-strategy-replicas.yaml
 
@@ -223,6 +277,7 @@ run-d: teardown-cluster && bench-d
 # Separate `just` invocations on purpose: within ONE invocation just runs each recipe at
 # most once, so `run-all: run-a run-b run-c run-d` would fire `teardown` only before A —
 # B and C would then measure whatever was still serving, silently, under the wrong label.
+[doc("The whole tour in talk order, ending in compare")]
 run-all:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -235,21 +290,27 @@ run-all:
 # --- measurement only (strategy already applied) ----------------------------
 
 # A · TEP8 — the latency shape.
+[doc("Measure A (assumes it is already serving)")]
 bench-a: (_bench "A-tep8" "TEP8 (RayJob)" "latency shape: attention sliced 8 ways over NVLink, whole experts per GPU" "v4-flash-openai" "32")
 
 # B · DP8 x EP (+ MegaMoE, + DSpark) — the published reference shape.
+[doc("Measure B")]
 bench-b: (_bench "B-dp8-ep" "DP8xEP + MegaMoE + DSpark" "the published reference config, widened from DP4/4xGB300" "v4-flash-openai" "32")
 
 # B without DSpark — isolates the speculator's cost on the same harness.
+[doc("Measure B without DSpark")]
 bench-b-nospec: (_bench "B-dp8-ep-nospec" "DP8xEP, DSpark off" "isolates DSpark: identical to B with --speculative-config removed" "v4-flash-openai" "32")
 
+[doc("B with --speculative-config removed, to isolate DSpark")]
 run-b-nospec: teardown _ensure-cluster && bench-b-nospec
     kubectl apply -f 20b-strategy-dp8-ep-nospec.yaml
 
 # C · P/D disaggregation on one machine, through vllm-router.
+[doc("Measure C through the router")]
 bench-c: (_bench "C-pd" "P/D TP4 -> DP4xEP (vllm-router)" "prefill and decode pools scale independently; KV rides NIXL over NVLink" "pd-router" "32")
 
 # C through the hand-written fallback proxy instead of vllm-router (applies 30b on demand).
+[doc("Measure C through the hand-written fallback proxy instead")]
 bench-c-proxy:
     kubectl apply -f 30b-pd-proxy-fallback.yaml
     @just _bench "C-pd-proxy" "P/D via the fallback proxy" "the minimal two-phase proxy, for comparison with vllm-router" "pd-proxy" "32"
@@ -258,6 +319,7 @@ bench-c-proxy:
 # At a fixed 32 total, two replicas get 16 each, neither fills a batch, and aggregate comes
 # out flat vs one machine — which reads as "scale-out does nothing". It isn't; scale-out
 # buys capacity at a given latency, so the load has to grow with it.
+[doc("Measure D, scaling offered load to 32 requests per replica")]
 bench-d:
     #!/usr/bin/env bash
     set -uo pipefail
@@ -272,6 +334,7 @@ bench-d:
     just _bench "D-replicas" "${n}x 8xB200 replicas (Ray per replica)" "capacity scales per machine; the Service balances per connection" "v4-flash-replicas" "$((32 * n))"
 
 # D behind vllm-router instead of the bare Service — retries + per-request balancing.
+[doc("Measure D behind vllm-router instead of the bare Service")]
 bench-d-router:
     #!/usr/bin/env bash
     set -uo pipefail
@@ -322,6 +385,7 @@ bench-d-router:
 #
 # Run this before quoting any D number. If the two pods disagree by more than ~1.5x, the
 # fleet aggregate is noise: warm them and measure again rather than deleting anything.
+[doc("Measure each D replica ALONE — a fleet aggregate hides a cold pod")]
 probe-d concurrency="32" max_tokens="256":
     #!/usr/bin/env bash
     set -uo pipefail
@@ -455,6 +519,7 @@ _kv-tokens name:
 # shapes than a scale-out; you cannot have all four (40 GPUs).
 
 # Bring up the demo configuration: C and D together, then warm everything.
+[doc("Bring up the demo-day configuration and warm it")]
 stage-up:
     #!/usr/bin/env bash
     set -uo pipefail
@@ -466,11 +531,20 @@ stage-up:
     kubectl apply -f 40-strategy-replicas.yaml
     echo "both applied; waiting for engines (this is the 20-25 min you are moving off stage)"
     just wait-ready 8097 pd-router || echo "WARNING: C not ready"
-    kubectl -n {{ns}} rollout status deploy/v4-flash-replicas --timeout=45m || echo "WARNING: D not ready"
+    # NOT `|| echo WARNING`: swallowing this proceeded to `just warm` while the replicas were
+    # still NotReady and therefore absent from the Service's endpoints, so D went unwarmed —
+    # exactly the cold-measured-shape condition that produced its 218-4417 tok/s bimodality.
+    # 40- now sets progressDeadlineSeconds so this reports real failure, not the 600s default.
+    kubectl -n {{ns}} rollout status deploy/v4-flash-replicas --timeout=45m || {
+      echo "FATAL: D did not become Ready. Not warming, not measuring — an unwarmed replica"
+      echo "measures ~400 tok/s against a warm one's ~2300 and looks like a real result."
+      kubectl -n {{ns}} get pods -l app=v4-flash-replica
+      exit 1; }
     just warm
     just state
 
 # Tear the stage configuration down.
+[doc("Tear the demo configuration back down")]
 stage-down: teardown-cluster
     @echo "stage torn down"
 
@@ -479,6 +553,7 @@ stage-down: teardown-cluster
 # That is what made D look capped at ~425 tok/s through two independent measurement paths.
 # Run after stage-up, and again whenever anything restarts.
 # Make every live endpoint generate once — readiness is not warmth.
+[doc("Make every live endpoint generate once, at the measured shape")]
 warm:
     #!/usr/bin/env bash
     set -uo pipefail
@@ -511,6 +586,7 @@ warm:
 # `kubectl port-forward` does not survive it. The tunnel died mid-request, the script saw an
 # empty stream, and the following depths all failed "connection refused" — a tooling failure
 # that reads exactly like the model rejecting the window. Same reason every bench runs as a Job.
+[doc("Needle-in-a-haystack at the full 1M window, run in-cluster")]
 longctx tokens="1000000" depth="0.5":
     #!/usr/bin/env bash
     set -uo pipefail
@@ -537,6 +613,7 @@ _longctx-run tokens depth:
 # The depth sweep is the part that actually tests CSA: a model attending only to the head and
 # tail of its window still passes a needle test at depth 0.0 or 1.0.
 # TTFT vs context length, plus the needle at five depths through the 1M window.
+[doc("TTFT vs context length, plus the needle at five depths through 1M")]
 longctx-sweep:
     #!/usr/bin/env bash
     set -uo pipefail
@@ -573,6 +650,7 @@ _snapshot round stem:
     echo "snapshot: {{stem}}__{{round}}"
 
 # Measurement variance with the engine held constant: bench N times, snapshot each.
+[doc("Run one bench N times, snapshotting each result")]
 repeat-bench recipe stem rounds="3" tag="r":
     #!/usr/bin/env bash
     set -uo pipefail
@@ -583,6 +661,7 @@ repeat-bench recipe stem rounds="3" tag="r":
     done
 
 # Full tour repeated N times (~1.5 h/round): engine-to-engine + measurement variance.
+[doc("Run the whole tour N times for a stability read")]
 repeat-tour rounds="2":
     #!/usr/bin/env bash
     set -uo pipefail
@@ -598,17 +677,20 @@ repeat-tour rounds="2":
     done
 
 # Median / min / max / spread across every repeat — flags anything above 1.5x.
+[doc("Median and spread across repeat runs — is a number a measurement yet?")]
 stability:
     @python3 stability.py metrics/_repeat
 
 # --- comparison -------------------------------------------------------------
 
 # Every strategy side by side, each next to the point it is meant to make.
+[doc("Every strategy side by side, each next to the point it makes")]
 compare:
     @python3 compare.py metrics
 
 # Wipe the current measurements. Keeps _archive-* runs: those are the evidence behind
 # several README and speaker-prep claims, and `rm -rf metrics` used to destroy them.
+[doc("Archive metrics/*.json rather than deleting them")]
 clean-metrics:
     -@rm -f metrics/[A-Z]*.json
     @echo "current metrics cleared; archives kept:"; ls metrics/_archive-* 2>/dev/null | wc -l

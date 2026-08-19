@@ -72,6 +72,35 @@ def stream_once(url, model, max_tokens, prompt=PROMPT):
     return ttft, tpot, tokens, total
 
 
+# A deterministic question with one right answer. This exists because "0 failed requests" is
+# not the same as "correct output": strategy C's prefill pool returned HTTP 200 with fluent
+# nonsense ("What is 2+2?" -> " \u2014 \nB.2.2.2.2.2...") for hours, and this harness happily
+# reported 1,703.9 tok/s for it, because it counted tokens without ever reading one. Any
+# throughput number from an engine that fails this check is measuring the speed of garbage.
+SANITY_Q = "What is 2+2? Reply with only the number."
+SANITY_A = "4"
+
+
+def sanity(url, model):
+    """-> (passed, answer). Never raises; a failure here must not lose the whole run."""
+    try:
+        body = json.dumps({
+            "model": model,
+            "messages": [{"role": "user", "content": SANITY_Q}],
+            "max_tokens": 16,
+            "temperature": 0.0,
+            "stream": False,
+        }).encode()
+        req = urllib.request.Request(url, data=body,
+                                    headers={"content-type": "application/json"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            msg = json.loads(resp.read())["choices"][0]["message"]
+        answer = (msg.get("content") or msg.get("reasoning_content") or "").strip()
+    except Exception as exc:                       # noqa: BLE001 - report, never crash
+        return False, f"<error: {exc!r}>"
+    return SANITY_A in answer, answer
+
+
 def pass_single(url, model, max_tokens, runs):
     ttfts, tpots, rates = [], [], []
     for _ in range(runs):
@@ -198,6 +227,13 @@ def main():
     # request can trigger tens of seconds of lazy autotune. Warming after it meant the
     # latency numbers (the deck's "A is the latency shape") were gathered cold while the
     # throughput numbers were gathered warm.
+    # Correctness BEFORE speed. A garbage engine must not produce a clean-looking column.
+    ok, answer = sanity(url, args.model)
+    print(f"sanity: {SANITY_Q!r} -> {answer!r} [{'PASS' if ok else 'FAIL'}]", flush=True)
+    if not ok:
+        print("  !! OUTPUT IS NOT SANE. Timings below measure the speed of wrong answers.",
+              flush=True)
+
     print(f"warming every endpoint before measuring ({len(urls)} endpoint(s))", flush=True)
     warmup(urls, args.model, args.concurrency, args.max_tokens)
 

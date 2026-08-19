@@ -32,8 +32,16 @@ def grab(pattern, cast=float):
     return cast(m.group(1)) if m else None
 
 
+# The sanity line is the difference between "fast" and "fast AND right". If bench.py could
+# not get a correct answer to 2+2, every timing in this file describes garbage.
+m = re.search(r"sanity: .* -> (.*) \[(PASS|FAIL)\]", log)
+sane = (m.group(2) == "PASS") if m else None
+sane_answer = m.group(1) if m else None
+
 out = {
     "name": name,
+    "output_sane": sane,
+    "sanity_answer": sane_answer,
     "label": label,
     "claim": claim,
     "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
