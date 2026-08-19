@@ -138,6 +138,7 @@ teardown:
     -@kubectl delete -f 30b-pd-proxy-fallback.yaml --ignore-not-found 2>/dev/null
     -@kubectl delete -f 40-strategy-replicas.yaml --ignore-not-found 2>/dev/null
     -@kubectl delete -f 40b-replicas-router.yaml --ignore-not-found 2>/dev/null
+    -@kubectl delete -f 50-longctx-1m.yaml --ignore-not-found 2>/dev/null
     @just _wait-gpus-free "1"
 
 # Also delete the RayCluster — needed before strategy D, whose two replicas want
@@ -498,6 +499,61 @@ warm:
       rm -f "metrics/_warm-$svc.json"
     done
     echo "warm: every live endpoint has generated at least once"
+
+# --- the 1M window ------------------------------------------------------------
+# Slides 1, 2, 6 and 12 lean on the 1M-token window while A-D all serve 262144. These
+# recipes make the claim demonstrable. Needs 50-longctx-1m.yaml applied, which needs a whole
+# machine free — see that file's header for the scale-down.
+
+# Needle-in-a-haystack at the full 1M window, run INSIDE the cluster.
+#
+# In-cluster, not through a tunnel: a 1M-token prompt is a ~5.8 MB POST body and
+# `kubectl port-forward` does not survive it. The tunnel died mid-request, the script saw an
+# empty stream, and the following depths all failed "connection refused" — a tooling failure
+# that reads exactly like the model rejecting the window. Same reason every bench runs as a Job.
+longctx tokens="1000000" depth="0.5":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    just _longctx-run "{{tokens}}" "{{depth}}"
+
+# One in-cluster longctx Job, start to finish. Shared by longctx and longctx-sweep so a
+# sweep cannot leave a half-finished Job behind for the next iteration to trip over.
+_longctx-run tokens depth:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    kubectl -n {{ns}} delete job longctx-in-cluster --ignore-not-found >/dev/null 2>&1
+    sleep 2
+    kubectl -n {{ns}} create configmap longctx-src --from-file=longctx.py=longctx.py \
+      --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+    # A fresh tag per run defeats prefix caching; see longctx.py's build().
+    sed -e "s|__NS__|{{ns}}|g" -e "s|__SVC__|v4-flash-longctx|g" \
+        -e "s|__TOKENS__|{{tokens}}|g" -e "s|__DEPTH__|{{depth}}|g" \
+        -e "s|__TAG__|$(date -u +%H%M%S)-$$|g" \
+        longctx-job.yaml.tmpl | kubectl apply -f - >/dev/null
+    just _job-wait longctx-in-cluster 1200 || {
+      kubectl -n {{ns}} logs job/longctx-in-cluster --tail=8 2>/dev/null; exit 1; }
+    kubectl -n {{ns}} logs job/longctx-in-cluster 2>/dev/null | grep -E "prompt_tokens|REJECTED|NO CONTENT|UNREACHABLE|target"
+
+# The depth sweep is the part that actually tests CSA: a model attending only to the head and
+# tail of its window still passes a needle test at depth 0.0 or 1.0.
+# TTFT vs context length, plus the needle at five depths through the 1M window.
+longctx-sweep:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    kubectl -n {{ns}} rollout status deploy/v4-flash-longctx --timeout=40m || exit 1
+    echo "=== what this engine reports about its own cache ==="
+    kubectl -n {{ns}} logs deploy/v4-flash-longctx 2>/dev/null \
+      | grep -oE "GPU KV cache size: [0-9,]+ tokens|Maximum concurrency for [0-9,]+ tokens per request: [0-9.]+x" \
+      | tail -2 | sed 's/^/  /'
+    echo "=== TTFT vs context length (needle at mid-depth) ==="
+    for n in 128000 250000 500000 1000000; do
+      just _longctx-run "$n" 0.5 | grep -E "prompt_tokens|REJECTED|NO CONTENT|UNREACHABLE" | sed 's/^/  /' || true
+    done
+    echo "=== needle depth sweep at 1M — head, middle and tail ==="
+    for d in 0.05 0.25 0.5 0.75 0.95; do
+      printf "  depth %-5s" "$d"
+      just _longctx-run 1000000 "$d" | grep -oE "needle (FOUND|MISSED)|REJECTED|NO CONTENT|UNREACHABLE" | head -1 || echo " no result"
+    done
 
 # --- repeatability ----------------------------------------------------------
 # One sample is not a measurement. This session produced 424 and 4652 tok/s from the same

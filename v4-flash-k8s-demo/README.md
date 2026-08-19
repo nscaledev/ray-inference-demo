@@ -18,6 +18,7 @@ The weights are downloaded **once** to a shared RWX PVC; each strategy is a
 | B′ | `20b-strategy-dp8-ep-nospec.yaml` | same, `--speculative-config` removed | 1 machine | isolates what DSpark costs — the only honest way to claim a number for it |
 | C | `30-strategy-pd-single-node.yaml` | TP4 prefill → DP4×EP decode over NIXL, two RayJobs + `vllm-router` | 1 machine, 4+4 GPUs placed by Ray | P/D end-to-end on one machine, and the largest cache budget |
 | D | `40-strategy-replicas.yaml` (+ optional `40b`) | whole replicas of **A** behind a Service or `vllm-router` | 2 machines | scale-out. Replicate the winner, not the reference |
+| 1M | `50-longctx-1m.yaml` | strategy A's shape with `--max-model-len 1048576` | 1 machine | the native window, *served* — the cache-is-the-product claim, demonstrated rather than stated |
 
 **Numbers live in `metrics/`, not in this README** — run `just compare` for the table and
 `just stability` for the spread across repeats. Hardcoding them here went stale twice in one
@@ -93,6 +94,8 @@ just run-all         # the whole tour in talk order, ending in `compare`
 
 just compare         # all strategies side by side, each next to the point it makes
 just probe-d         # measure each D replica ALONE — a fleet number hides a cold pod
+just longctx         # needle-in-a-haystack at the full 1M window
+just longctx-sweep   # TTFT vs context length + needle depth sweep
 just logs            # follow the running RayJob's driver log
 just teardown        # free the GPUs, keep the RayCluster + weights
 just teardown-cluster # also drop the RayCluster
@@ -126,6 +129,72 @@ Three candidate images all claim V4-Flash support and none are interchangeable. 
 (5.8 vs 105 tok/s single-stream). The megamoe dev build is fast but has no `dspark`.
 **Never compare numbers across these images** — the same manifest gave a 45× different KV
 budget between builds, which is how a "45× TP-vs-DP finding" turned out to be an artefact.
+
+## The 1M window
+
+Strategies A–D all serve `--max-model-len 262144`. That is a deliberate setting, not a
+limit of the model: 256K is the demo's point on the context ↔ throughput dial. `50` exists
+so the 1M claim can be shown.
+
+```
+kubectl -n v4-flash-demo scale deploy/v4-flash-replicas --replicas=1   # free a machine
+kubectl apply -f 50-longctx-1m.yaml
+just longctx                 # needle-in-a-haystack at ~1M tokens
+just longctx-sweep           # TTFT vs context length, then the needle at five depths
+```
+
+**Measured** — in-cluster, prefix caching defeated, needle at mid-depth:
+
+| prompt tokens | TTFT | step |
+|---|---|---|
+| 127,592 | 7.9 s | |
+| 249,098 | 12.0 s | ×1.95 tokens → ×1.52 TTFT |
+| 498,074 | 19.8 s | ×2.00 tokens → ×1.65 TTFT |
+| **996,068** | **57.9 s** | ×2.00 tokens → ×2.92 TTFT ← the knee |
+
+Overall **7.8× the context for 7.3× the TTFT — roughly linear, not sub-linear.** Cost grows
+slower than context up to ~500K, then the last doubling is where it turns. Don't blend this
+with a curve from the 262144 engine; different `max_model_len` means a different KV layout,
+and mixing them is the same error `just compare` warns about for images.
+
+Needle **FOUND at all five depths** (0.05 / 0.25 / 0.50 / 0.75 / 0.95) at 996,068 tokens.
+
+**Why a needle test and not just a long prompt.** Accepting a 1M-token prompt proves
+nothing; answering from a fact buried in the middle of it does. `longctx.py` hides a
+passphrase at a chosen depth and checks it comes back. The depth sweep matters because a
+model that attends only to the head and tail of its window still passes a needle test at
+depth 0.0 or 1.0 — the middle depths are what exercise CSA's token selection.
+
+**Two ways this measurement lies, both hit while building it:**
+
+1. **Prefix caching makes long prompts look cheap.** Successive runs sharing a filler prefix
+   let the engine serve most of the window from cache. A sweep produced TTFT
+   7.9 / 39.8 / 42.7 / **6.0 s** at 5K / 20K / 79K / 155K prompt tokens — the longest prompt
+   looked cheapest. `longctx.py` now puts a unique tag in the first line of every prompt to
+   defeat it. Prefix caching is a real feature and worth demoing on its own; it is just not
+   what "prefill cost at 1M" means.
+2. **"~4 chars per token" is wrong by 45% here.** This tokenizer and filler measure 5.81
+   chars/token, so a request built for "250K" was really 155K. The script reports measured
+   chars/token every run, and only `usage.prompt_tokens` is trusted for length.
+
+**Cache arithmetic — measured, and it contradicts the intuitive version.** The naive story
+is "A reports ~5.5M KV tokens, so a 1M request eats a fifth and ~5 fit". Measured, that is
+wrong. Both engines are the same TEP8 shape on the same 8× B200 with the same 34 engine args;
+only `--max-model-len` differs:
+
+| window | KV cache tokens | bytes/token | max concurrency |
+|---|---|---|---|
+| 262,144 | 5,503,901 | 26,973 | 21.0× |
+| 1,048,576 | **15,626,973** | **9,431** | 14.9× |
+
+Same ~138 GiB of KV memory, 2.84× more tokens in it. Per-token cost *falls* 2.86× as the
+configured window grows, so a **4× window costs 1.41× in concurrency, not 4×**. The likely
+mechanism — inferred from the measurement, not read from the source — is the two-tier
+attention: with a longer window a larger share of each sequence sits in HCA's heavily
+compressed tier, so average bytes/token drops. It is the concrete version of the model card's
+"~10% of V3.2's cache at 1M".
+
+Reproduce with `kubectl -n v4-flash-demo logs deploy/v4-flash-longctx | grep -E "KV cache size|Maximum concurrency"`.
 
 ## Demo flow (~18 min)
 

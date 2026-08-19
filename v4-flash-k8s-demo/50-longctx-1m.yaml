@@ -1,0 +1,162 @@
+# 50 — THE 1M WINDOW, actually served.
+#
+# Slides 1, 2, 6 and 12 lean on the 1M-token window; strategies A-D all serve 262144, and
+# slide 7 is explicit that 256K is the demo's setting. This file exists so the 1M claim can
+# be *shown* rather than only stated: same weights, same TEP8 shape as strategy A, one flag
+# different.
+#
+#   --max-model-len 1048576     the native window, not the demo's 256K
+#
+# WHAT RAISING THE WINDOW ACTUALLY COSTS — measured, and not what intuition says.
+#
+# The naive arithmetic is: strategy A reports ~5.5M tokens of KV cache, so a 1M-token request
+# eats a fifth of it and about 5 fit. That is WRONG, and this engine disproves it. Both
+# engines are the same TEP8 shape on the same 8x B200 with the same 34 engine args — the only
+# difference is --max-model-len:
+#
+#   window       KV cache tokens   bytes/token   max concurrency   (vLLM's own log lines)
+#   262,144        5,503,901         26,973          21.00x
+#   1,048,576     15,626,973          9,431          14.90x
+#
+# Same ~138 GiB of KV memory, 2.84x MORE tokens in it. Per-token cost drops 2.86x when the
+# configured window grows, so a 4x window costs only 1.41x in concurrency — not 4x.
+#
+# The likely mechanism, inferred from the measurement rather than read from the source: this
+# is the two-tier attention the long-context slide describes. CSA narrows what attention looks
+# at and HCA compresses how it is stored, and vLLM sizes the per-token budget for the window
+# it was given — with a longer window a larger share of each sequence sits in the heavily
+# compressed tier, so the AVERAGE bytes per token falls. It is the concrete version of the
+# model card's "~10% of V3.2's cache at 1M".
+#
+# Reproduce both lines with:
+#   kubectl -n v4-flash-demo logs deploy/v4-flash-longctx | grep -E "KV cache size|Maximum concurrency"
+#
+# MEASURED, in-cluster, prefix caching defeated, needle at mid-depth (`just longctx-sweep`):
+#
+#   prompt tokens   TTFT     step
+#       127,592     7.9s
+#       249,098    12.0s     x1.95 tokens -> x1.52 TTFT
+#       498,074    19.8s     x2.00 tokens -> x1.65 TTFT
+#       996,068    57.9s     x2.00 tokens -> x2.92 TTFT   <-- the knee
+#
+# Overall 7.8x the context for 7.3x the TTFT: roughly LINEAR, not sub-linear. Be careful
+# quoting this — cost grows slower than context up to ~500K, and then the final doubling to 1M
+# is where it turns. An earlier "8x context for 2.3x TTFT" line came from the 262144 engine
+# over 32K-249K; that is a DIFFERENT engine config and the two curves must not be blended,
+# for the same reason `just compare` refuses to mix images.
+#
+# Needle depth sweep at 996,068 tokens: FOUND at 0.05, 0.25, 0.50, 0.75 and 0.95. The middle
+# depths are the ones that matter — head/tail-only attention passes at 0.0 and 1.0 for free.
+#
+# GPU BUDGET: this wants a whole 8x B200 node, and the cluster has 24 GPUs total. C's Ray
+# head holds 8 and D's replicas hold 16, so make room first:
+#
+#   kubectl -n v4-flash-demo scale deploy/v4-flash-replicas --replicas=1
+#   kubectl apply -f 50-longctx-1m.yaml
+#   just longctx                      # needle test at 1M, plus the depth sweep
+#
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: v4-flash-longctx
+  namespace: v4-flash-demo
+spec:
+  replicas: 1
+  strategy: { type: Recreate }        # holds a whole machine; see 40 for why not RollingUpdate
+  # Default progressDeadlineSeconds is 600, but this engine's readiness budget is
+  # initialDelay 120 + failureThreshold 90 x 10s = 1020s. `kubectl rollout status` therefore
+  # reported "exceeded its progress deadline" while the pod was still legitimately in
+  # FlashInfer autotune. A deadline shorter than the work it waits for is not a timeout,
+  # it is a false alarm.
+  progressDeadlineSeconds: 2400
+  selector: { matchLabels: { app: v4-flash-longctx } }
+  template:
+    metadata: { labels: { app: v4-flash-longctx } }
+    spec:
+      nodeSelector:
+        nvidia.com/gpu.product: "NVIDIA-B200"
+      affinity:
+        podAntiAffinity:              # never share a machine with a strategy-D replica
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values: ["v4-flash-replica", "v4-flash-longctx"]
+              topologyKey: kubernetes.io/hostname
+      terminationGracePeriodSeconds: 300
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.27.1
+          command: ["bash", "-lc"]
+          args:
+            - |
+              exec vllm serve /models/DeepSeek-V4-Flash-0731 \
+                --served-model-name deepseek-ai/DeepSeek-V4-Flash-0731 \
+                --distributed-executor-backend ray \
+                --tensor-parallel-size 8 \
+                --enable-expert-parallel \
+                --trust-remote-code \
+                --kv-cache-dtype fp8 --block-size 256 \
+                --attention-config '{"use_fp4_indexer_cache":true}' \
+                --tokenizer-mode deepseek_v4 \
+                --tool-call-parser deepseek_v4 --enable-auto-tool-choice \
+                --reasoning-parser deepseek_v4 \
+                --max-model-len 1048576 \
+                --host 0.0.0.0 --port 8000
+          env:
+            - { name: HF_HOME, value: /models/hf-cache }
+            - { name: PYTHONPATH, value: /models/ray-site }
+            - { name: VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR, value: /root/.cache/flashinfer }
+            - { name: PATH, value: "/models/ray-site/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
+          ports: [{ containerPort: 8000 }]
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 120
+            periodSeconds: 10
+            failureThreshold: 90
+          resources:
+            requests: { nvidia.com/gpu: "8", cpu: "64", memory: 512Gi }
+            limits:   { nvidia.com/gpu: "8", memory: 900Gi }
+          volumeMounts:
+            - { name: models, mountPath: /models, readOnly: true }
+            - { name: dshm, mountPath: /dev/shm }
+            - { name: jit-cache, mountPath: /root/.cache }
+            - { name: tilelang-cache, mountPath: /root/.tilelang }
+      volumes:
+        - name: models
+          persistentVolumeClaim: { claimName: v4-flash-models, readOnly: true }
+        - name: dshm
+          emptyDir: { medium: Memory, sizeLimit: 256Gi }
+        - name: jit-cache
+          hostPath: { path: /var/lib/v4-flash/vllm-cache, type: DirectoryOrCreate }
+        - name: tilelang-cache
+          hostPath: { path: /var/lib/v4-flash/tilelang-cache, type: DirectoryOrCreate }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: v4-flash-longctx
+  namespace: v4-flash-demo
+spec:
+  selector: { app: v4-flash-longctx }
+  ports: [{ port: 8000, targetPort: 8000 }]
+---
+# HOW TO RUN + MEASURE
+#
+#   kubectl -n v4-flash-demo scale deploy/v4-flash-replicas --replicas=1   # free a machine
+#   kubectl apply -f 50-longctx-1m.yaml
+#   just longctx                  # needle at ~1M, then a depth sweep
+#   just longctx-sweep            # TTFT vs context length, prefix caching defeated
+#
+# What the needle test proves that a long prompt alone does not: the answer has to come back
+# from a fact buried in the middle of the window. A model attending only to the head and tail
+# still passes at depth 0.0 or 1.0, so the sweep runs the middle depths too — that is what
+# exercises CSA's token selection.
+#
+# On measuring this honestly: `longctx.py` puts a unique tag in the FIRST line of every
+# prompt. Without it, successive runs share the filler prefix, the engine serves most of the
+# window from its prefix cache, and the longest prompt comes out looking like the cheapest —
+# a sweep genuinely produced TTFT 7.9s / 39.8s / 42.7s / 6.0s at 5K / 20K / 79K / 155K
+# tokens before that was fixed. Prefix caching is a real feature and worth demoing on its
+# own; it is just not what "prefill cost at 1M" means.

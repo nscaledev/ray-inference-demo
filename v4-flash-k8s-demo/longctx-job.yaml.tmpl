@@ -1,0 +1,45 @@
+# Template for the in-cluster long-context Job. Same substitution trick as
+# bench-job.yaml.tmpl: `just` replaces the __PLACEHOLDERS__ with sed rather than embedding
+# YAML inside python inside just, which broke the justfile parser twice.
+#
+# Why this runs IN the cluster rather than through `kubectl port-forward`: a 1M-token prompt
+# is a ~5.8 MB POST body, and port-forward does not survive it. The tunnel died mid-request,
+# longctx.py reported no content back, and every following depth in the sweep failed with
+# "connection refused" — a tooling failure that looks exactly like the model refusing the
+# window. Talking to the Service by DNS removes the tunnel from the measurement entirely,
+# which is the same reason every bench Job runs in-cluster.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: longctx-in-cluster
+  namespace: __NS__
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: longctx
+          image: python:3.12-slim
+          command: ["python3", "/src/longctx.py"]
+          args:
+            - "--host"
+            - "__SVC__"
+            - "--port"
+            - "8000"
+            - "--tokens"
+            - "__TOKENS__"
+            - "--depth"
+            - "__DEPTH__"
+            - "--tag"
+            - "__TAG__"
+          resources:
+            # A 1M-token prompt is built as one ~5.8 MB string and sent as one body; the
+            # default limitless container is fine on CPU but this keeps it schedulable on
+            # the control-plane VMs alongside everything else.
+            requests: { cpu: "1", memory: 2Gi }
+          volumeMounts:
+            - { name: src, mountPath: /src }
+      volumes:
+        - name: src
+          configMap: { name: longctx-src }
