@@ -388,8 +388,13 @@ run-b: teardown _ensure-cluster && bench-b
 run-c: teardown _ensure-cluster && bench-c
     kubectl apply -f 30-strategy-pd-single-node.yaml
 
+# Keeps the RayCluster up: the head holds 8 GPUs and D wants 16, which is exactly the 24 this
+# cluster has. This used to be `teardown-cluster` because strategy A was a RayJob competing for
+# the head's GPUs — A is a Deployment now (see 10b), so the cluster can stay for B/B-nospec.
+# NOTE: a [doc] attribute must sit IMMEDIATELY above its recipe; comments in between orphan it
+# and just errors with "Extraneous attribute".
 [doc("D · whole replicas across machines behind one Service")]
-run-d: teardown-cluster && bench-d
+run-d: teardown && bench-d
     kubectl apply -f 40-strategy-replicas.yaml
 
 # The whole tour, in talk order, ending in the comparison table.
