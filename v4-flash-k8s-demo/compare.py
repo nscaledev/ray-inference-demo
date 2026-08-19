@@ -13,6 +13,7 @@ Designed for a partly-run tour — on demo day you may only get through A and B.
     strategies measured at different offered load is the easiest way to lie to yourself
 """
 import json
+import statistics
 import sys
 from pathlib import Path
 
@@ -46,15 +47,44 @@ FIELDS = [
 
 
 def load(dirname):
-    """Return {stem: data} for every non-archived metrics file present."""
+    """Return {stem: data} using WARM MEDIANS where repeat snapshots exist.
+
+    metrics/<stem>.json holds only the LAST run, and the last run is not the strategy: the
+    first passes after a deploy are still warming (D read 2278 against a warm 4836). Reading
+    the single file made this table disagree with `just claims` and with slide 8, both of which
+    use warm medians — A showed 2410.6 here and 2740.5 there. One source of truth instead.
+    """
+    root = Path(dirname)
     out = {}
-    for f in sorted(Path(dirname).glob("*.json")):
+    for f in sorted(root.glob("*.json")):
         if f.stem.startswith("_"):        # _archive-* runs are kept but never charted
             continue
         try:
-            out[f.stem] = json.loads(f.read_text())
+            data = json.loads(f.read_text())
         except (json.JSONDecodeError, OSError) as exc:
             print(f"  ! skipping {f.name}: {exc}", file=sys.stderr)
+            continue
+        snaps = [q for q in sorted((root / "_repeat").glob(f"{f.stem}__*.json"))
+                 if not q.name.startswith("_")]
+        runs = []
+        for q in snaps:
+            try:
+                runs.append(json.loads(q.read_text()))
+            except (json.JSONDecodeError, OSError):
+                pass
+        warm = runs[1:] if len(runs) >= 3 else runs
+        if warm:
+            for sec, fld in (("under_load", "aggregate_output_tok_s"),
+                             ("under_load", "ttft_s_p95"),
+                             ("single_stream", "ttft_s_p50"),
+                             ("single_stream", "tpot_ms_p50"),
+                             ("single_stream", "output_tok_s")):
+                vals = [r[sec][fld] for r in warm
+                        if isinstance(r.get(sec, {}).get(fld), (int, float))]
+                if vals and sec in data:
+                    data[sec][fld] = round(statistics.median(vals), 3)
+            data["_warm_n"] = len(warm)
+        out[f.stem] = data
     return out
 
 
@@ -91,6 +121,7 @@ def main():
     label_w = 22
     col_w = max(14, min(22, 100 // max(1, len(cols))))
     print()
+    print("(warm medians where repeats exist — same source as `just claims`)\n")
     print("MEASURED".ljust(label_w) + "".join(c[1][:col_w - 1].ljust(col_w) for c in cols))
     print("-" * (label_w + col_w * len(cols)))
     # A column that failed the output-sanity check has its TIMINGS BLANKED, not merely

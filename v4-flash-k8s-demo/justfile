@@ -209,28 +209,28 @@ _ask-strategy label want svc port prompt temp="1.0":
     just ask "{{prompt}}" "{{svc}}" "{{port}}" "{{temp}}"
 
 [doc("Ask strategy A and show the exchange (refuses unless A is serving)")]
-ask-a prompt="In one sentence: why keep expert routing inside the NVLink domain?":
-    @just _ask-strategy "A · TEP8 (TP8 + EP, Deployment)" deploy/v4-flash-tep8 v4-flash-tep8 8000 "{{prompt}}"
+ask-a prompt="In one sentence: why keep expert routing inside the NVLink domain?" temp="1.0":
+    @just _ask-strategy "A · TEP8 (TP8 + EP, Deployment)" deploy/v4-flash-tep8 v4-flash-tep8 8000 "{{prompt}}" "{{temp}}"
 
 [doc("Ask strategy B and show the exchange (refuses unless B is serving)")]
-ask-b prompt="In one sentence: what does speculative decoding change about decode?":
-    @just _ask-strategy "B · DP8xEP + MegaMoE + DSpark" serve-dp8-ep v4-flash-openai 8000 "{{prompt}}"
+ask-b prompt="In one sentence: what does speculative decoding change about decode?" temp="1.0":
+    @just _ask-strategy "B · DP8xEP + MegaMoE + DSpark" serve-dp8-ep v4-flash-openai 8000 "{{prompt}}" "{{temp}}"
 
 [doc("Ask B-without-DSpark and show the exchange")]
-ask-b-nospec prompt="In one sentence: what is expert parallelism?":
-    @just _ask-strategy "B - DSpark (DP8xEP + MegaMoE)" serve-dp8-ep-nospec v4-flash-openai 8000 "{{prompt}}"
+ask-b-nospec prompt="In one sentence: what is expert parallelism?" temp="1.0":
+    @just _ask-strategy "B - DSpark (DP8xEP + MegaMoE)" serve-dp8-ep-nospec v4-flash-openai 8000 "{{prompt}}" "{{temp}}"
 
 [doc("Ask strategy C through the P/D router (expected to FAIL the sanity check — see 30-)")]
-ask-c prompt="What is 2+2? Reply with only the number.":
-    @just _ask-strategy "C · P/D 4+4 via vllm-router" serve-pd-decode pd-router 8000 "{{prompt}}" 0.0
+ask-c prompt="What is 2+2? Reply with only the number." temp="0.0":
+    @just _ask-strategy "C · P/D 4+4 via vllm-router" serve-pd-decode pd-router 8000 "{{prompt}}" "{{temp}}"
 
 [doc("Ask strategy D through the replica Service")]
-ask-d prompt="In one sentence: what does scaling out with whole replicas buy you?":
-    @just _ask-strategy "D · replicas" deploy/v4-flash-replicas v4-flash-replicas 8000 "{{prompt}}"
+ask-d prompt="In one sentence: what does scaling out with whole replicas buy you?" temp="1.0":
+    @just _ask-strategy "D · replicas" deploy/v4-flash-replicas v4-flash-replicas 8000 "{{prompt}}" "{{temp}}"
 
 [doc("Ask the 1M-window engine and show the exchange")]
-ask-1m prompt="In one sentence: why does a longer context cost cache rather than compute?":
-    @just _ask-strategy "1M window (TP8 + EP, max-model-len 1048576)" deploy/v4-flash-longctx v4-flash-longctx 8000 "{{prompt}}"
+ask-1m prompt="In one sentence: why does a longer context cost cache rather than compute?" temp="1.0":
+    @just _ask-strategy "1M window (TP8 + EP, max-model-len 1048576)" deploy/v4-flash-longctx v4-flash-longctx 8000 "{{prompt}}" "{{temp}}"
 
 [doc("Ask EVERY live endpoint questions with known answers — PASS/FAIL per endpoint")]
 verify-output:
