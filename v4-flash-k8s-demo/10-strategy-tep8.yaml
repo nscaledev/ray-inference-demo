@@ -1,0 +1,53 @@
+# 10 — STRATEGY A: TEP8 (tensor + expert parallel, one 8x B200 machine)
+# The latency shape: attention sliced 8 ways over NVLink, whole experts per GPU.
+#
+#   kubectl apply -f 10-strategy-tep8.yaml
+#   kubectl -n v4-flash-demo get rayjob serve-tep8 -w
+# Switch away:
+#   kubectl -n v4-flash-demo delete rayjob serve-tep8
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: serve-tep8
+  namespace: v4-flash-demo
+spec:
+  clusterSelector:
+    ray.io/cluster: v4-flash
+  # HTTPMode: the operator submits over the head dashboard, so there is no
+  # submitter pod — which matters because this image has no ray to submit with.
+  submissionMode: HTTPMode
+  entrypoint: >-
+    vllm serve /models/DeepSeek-V4-Flash-0731
+    --served-model-name deepseek-ai/DeepSeek-V4-Flash-0731
+    --distributed-executor-backend ray
+    --tensor-parallel-size 8
+    --enable-expert-parallel
+    --trust-remote-code
+    --kv-cache-dtype fp8
+    --block-size 256
+    --attention-config '{"use_fp4_indexer_cache":true}'
+    --tokenizer-mode deepseek_v4
+    --tool-call-parser deepseek_v4
+    --enable-auto-tool-choice
+    --reasoning-parser deepseek_v4
+    --max-model-len 262144
+    --host 0.0.0.0 --port 8000
+---
+# HOW TO RUN + MEASURE THIS STRATEGY
+#
+# One command — tears down the previous strategy first (measuring one at a time is what
+# makes the columns comparable; 24 GPUs do allow C+D together, see `just stage-up`),
+# applies this one, waits for the engine, measures, and leaves it serving:
+#
+#   just run-a
+#
+# Or by hand:
+#   kubectl apply -f 10-strategy-tep8.yaml
+#   just bench-a                 # waits for readiness, measures, writes metrics/A-tep8.json
+#   just compare                 # this strategy next to the others
+#
+# Switch away:
+#   kubectl -n v4-flash-demo delete rayjob serve-tep8
+#
+# What the numbers should show: the best single-stream TTFT and TPOT of the four
+# shapes, and the weakest aggregate tok/s under concurrency. That trade IS the point.

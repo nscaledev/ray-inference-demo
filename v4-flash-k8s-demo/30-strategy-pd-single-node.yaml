@@ -1,0 +1,155 @@
+# 30 — STRATEGY C: P/D disaggregation on ONE machine, both pools on Ray.
+#
+# Prefill is compute-bound, decode is memory-bandwidth-bound. Two engines, sized
+# and parallelised for their own bottleneck, with NIXL moving the paged KV and the
+# sparse-attention indexer cache between them.
+#
+# RAY-NATIVE: both pools are RayJobs on the long-lived cluster from 03, each with
+# --distributed-executor-backend ray. Ray's placement groups own the GPU split —
+# prefill gets a 4-GPU bundle, decode gets the other 4 — so there is no
+# CUDA_VISIBLE_DEVICES juggling and both pools' actors are visible in the Ray
+# dashboard. On this cluster both bundles land inside one machine, so the KV
+# handoff rides NVLink; the same manifest scales out by adding a worker group.
+#
+#   just run-c        (or see the footer for the by-hand sequence)
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: serve-pd-prefill
+  namespace: v4-flash-demo
+spec:
+  clusterSelector:
+    ray.io/cluster: v4-flash
+  # HTTPMode: the operator submits over the head dashboard, so there is no
+  # submitter pod — which matters because this image has no ray to submit with.
+  submissionMode: HTTPMode
+  entrypoint: >-
+    vllm serve /models/DeepSeek-V4-Flash-0731
+    --served-model-name deepseek-ai/DeepSeek-V4-Flash-0731
+    --distributed-executor-backend ray
+    --tensor-parallel-size 4
+    --trust-remote-code
+    --kv-cache-dtype fp8
+    --block-size 256
+    --attention-config '{"use_fp4_indexer_cache":true}'
+    --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+    --max-num-batched-tokens 16384
+    --tokenizer-mode deepseek_v4
+    --max-model-len 262144
+    --host 0.0.0.0 --port 8100
+---
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: serve-pd-decode
+  namespace: v4-flash-demo
+spec:
+  clusterSelector:
+    ray.io/cluster: v4-flash
+  submissionMode: HTTPMode
+  entrypoint: >-
+    vllm serve /models/DeepSeek-V4-Flash-0731
+    --served-model-name deepseek-ai/DeepSeek-V4-Flash-0731
+    --distributed-executor-backend ray
+    --data-parallel-size 4
+    --data-parallel-backend ray
+    --enable-expert-parallel
+    --moe-backend deep_gemm_mega_moe
+    --trust-remote-code
+    --kv-cache-dtype fp8
+    --block-size 256
+    --attention-config '{"use_fp4_indexer_cache":true}'
+    --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+    --max-num-batched-tokens 512
+    --tokenizer-mode deepseek_v4
+    --tool-call-parser deepseek_v4
+    --enable-auto-tool-choice
+    --reasoning-parser deepseek_v4
+    --max-model-len 262144
+    --host 0.0.0.0 --port 8200
+---
+# Both engines' HTTP servers run in the Ray head pod (that is where a RayJob
+# entrypoint executes), so one Service exposes both pools on their own ports.
+apiVersion: v1
+kind: Service
+metadata:
+  name: pd-pools
+  namespace: v4-flash-demo
+spec:
+  selector:
+    ray.io/cluster: v4-flash
+    ray.io/node-type: head
+  ports:
+    - { name: prefill, port: 8100, targetPort: 8100 }
+    - { name: decode,  port: 8200, targetPort: 8200 }
+---
+# THE ROUTER — vllm-router, the standard one.
+#
+# vLLM ships a Rust load balancer with first-class prefill/decode disaggregation
+# (`--vllm-pd-disaggregation`), and the V4-Flash recipe page points at it. Use it
+# rather than hand-rolling. The hand-written alternative lives in
+# 30b-pd-proxy-fallback.yaml and is deliberately NOT applied here — it cost us a
+# real bug (an httpx client closed before its StreamingResponse finished reading:
+# 18 of 32 requests failed, 96 tok/s). With the router: 1670 tok/s, 0 failures.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pd-router
+  namespace: v4-flash-demo
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: pd-router } }
+  template:
+    metadata: { labels: { app: pd-router } }
+    spec:
+      containers:
+        - name: router
+          image: python:3.12-slim
+          command: ["bash", "-lc"]
+          args:
+            - |
+              pip install -q vllm-router &&
+              exec vllm-router \
+                --vllm-pd-disaggregation \
+                --policy consistent_hash \
+                --prefill http://pd-pools:8100 \
+                --decode  http://pd-pools:8200 \
+                --host 0.0.0.0 --port 8000
+          ports: [{ containerPort: 8000 }]
+          readinessProbe:
+            tcpSocket: { port: 8000 }
+            initialDelaySeconds: 20
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "2", memory: 4Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pd-router
+  namespace: v4-flash-demo
+spec:
+  selector: { app: pd-router }
+  ports: [{ port: 8000, targetPort: 8000 }]
+---
+# HOW TO RUN + MEASURE THIS STRATEGY
+#
+# One command — tears down the previous strategy first (measuring one at a time is what
+# makes the columns comparable; 24 GPUs do allow C+D together, see `just stage-up`),
+# applies this one, waits for the engine, measures, and leaves it serving:
+#
+#   just run-c
+#
+# Or by hand:
+#   kubectl -n v4-flash-demo delete rayjob serve-dp8-ep
+#   kubectl apply -f 30-strategy-pd-single-node.yaml
+#   just bench-c                 # via svc/pd-router on :8080, writes metrics/C-pd.json
+#   just compare
+#
+# Watch Ray place the two pools:
+#   kubectl -n v4-flash-demo port-forward svc/v4-flash-openai 8265:8265
+#   # dashboard -> two placement groups, 4 GPUs each, one machine
+#
+# What the numbers should show: TTFT p95 under load holding flatter than A or B —
+# long prefills land in the prefill pool and stop blocking decode. The cost is
+# peak on either side: each pool only gets four of the eight GPUs.

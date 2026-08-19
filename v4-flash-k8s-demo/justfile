@@ -1,0 +1,558 @@
+# Demo driver for the DeepSeek-V4-Flash Ray Summit talk.
+#   just              list recipes
+#   just state        what the cluster is running right now
+#   just bench-a      measure whichever strategy you just applied (a|b|c|d)
+#   just compare      all strategies side by side, each next to its point
+#
+# Metrics land in metrics/*.json so `just compare` works even after the pods are gone.
+
+export KUBECONFIG := env_var_or_default("KUBECONFIG", justfile_directory() + "/../ray-demo-kubeconfig.yaml")
+ns := "v4-flash-demo"
+model := "deepseek-ai/DeepSeek-V4-Flash-0731"
+
+default:
+    @just --list --unsorted
+
+# --- state ------------------------------------------------------------------
+
+# Cluster, GPUs, Ray, and which model (if any) is being served right now.
+state:
+    @echo "=== nodes / GPUs ==="
+    @kubectl get nodes -o custom-columns='NAME:.metadata.name,TYPE:.metadata.labels.node\.kubernetes\.io/instance-type,GPU:.status.allocatable.nvidia\.com/gpu'
+    @echo
+    @echo "=== GPU allocation (who holds them) ==="
+    @kubectl get pods -A -o json | python3 -c 'import json,sys; \
+      pods=json.load(sys.stdin)["items"]; \
+      rows=[(p["metadata"]["namespace"], p["metadata"]["name"], c["resources"].get("requests",{}).get("nvidia.com/gpu"), p["spec"].get("nodeName") or "-") \
+            for p in pods for c in p["spec"]["containers"] if c["resources"].get("requests",{}).get("nvidia.com/gpu")]; \
+      print("\n".join(f"  {g}x GPU  {ns}/{n}  on {node}" for ns,n,g,node in rows) or "  none")'
+    @echo
+    @echo "=== RayCluster ==="
+    @kubectl -n {{ns}} get raycluster 2>/dev/null || echo "  none"
+    @echo
+    @echo "=== RayJobs / strategy workloads ==="
+    @kubectl -n {{ns}} get rayjob 2>/dev/null | tail -n +1 || true
+    @kubectl -n {{ns}} get deploy 2>/dev/null | tail -n +1 || true
+    @echo
+    @echo "=== weights on the shared PVC ==="
+    @kubectl -n {{ns}} get pvc v4-flash-models --no-headers 2>/dev/null || echo "  no PVC"
+    @echo
+    @echo "=== served models (expect NONE before a strategy is applied) ==="
+    @-just _models
+
+_models:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    kubectl -n {{ns}} port-forward svc/v4-flash-openai 8000:8000 >/dev/null 2>&1 &
+    pf=$!; disown $pf 2>/dev/null || true; sleep 2
+    out=$(curl -sf -m 4 localhost:8000/v1/models 2>/dev/null || true)
+    kill $pf 2>/dev/null || true
+    if [ -z "$out" ]; then echo "  no OpenAI endpoint answering — nothing is serving"; else
+      echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("\n".join("  serving: "+m["id"] for m in d.get("data",[])) or "  endpoint up, no models")'
+    fi
+
+# Is the endpoint answering yet? (see the LIFECYCLE block near _bench for why these
+# three recipes are written together)
+wait-ready port="8000" svc="v4-flash-openai" budget="540":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    pf=""
+    drop_tunnel() { [ -n "${pf:-}" ] && kill "$pf" 2>/dev/null; pf=""; }
+    trap drop_tunnel EXIT INT TERM
+    echo "waiting for svc/{{svc}} to answer /v1/models (cold start: weights + kernel JIT)"
+    for i in $(seq 1 {{budget}}); do
+      # INVARIANT 2: re-establish every 60 s. A port-forward opened before the server binds
+      # stays alive, refuses everything, and never recovers — that looked exactly like a
+      # cold engine for 28 minutes while strategy B was already serving.
+      if [ $(( (i - 1) % 12 )) -eq 0 ]; then
+        drop_tunnel
+        kubectl -n {{ns}} port-forward svc/{{svc}} {{port}}:8000 >/dev/null 2>&1 &
+        pf=$!
+        sleep 2
+      fi
+      if curl -sf -m 4 "localhost:{{port}}/v1/models" >/dev/null 2>&1; then
+        echo "ready after ~$((i * 5))s"
+        exit 0
+      fi
+      [ $((i % 24)) -eq 0 ] && echo "  ... $((i * 5))s elapsed: weights, then ~8-12 min DeepGEMM JIT, then ~10 min FlashInfer autotune"
+      sleep 5
+    done
+    echo "NOT READY after $(( {{budget}} * 5 ))s — inspect with: just logs"
+    exit 1
+
+# Ray dashboard — placement groups, actors, GPU assignment. Blocks; Ctrl-C to stop.
+dashboard port="8265":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    echo "Ray dashboard -> http://localhost:{{port}}   (Ctrl-C to stop)"
+    command -v open >/dev/null && (sleep 2 && open "http://localhost:{{port}}" >/dev/null 2>&1 &) || true
+    exec kubectl -n {{ns}} port-forward svc/v4-flash-openai {{port}}:8265
+
+# Per-GPU utilisation and memory, from inside whichever pod holds the GPUs.
+gpus:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    for p in $(kubectl -n {{ns}} get pods -o name | cut -d/ -f2); do
+      if kubectl -n {{ns}} get pod "$p" -o jsonpath='{.spec.containers[*].resources.requests.nvidia\.com/gpu}' 2>/dev/null | grep -q '[0-9]'; then
+        echo "=== $p ==="
+        kubectl -n {{ns}} exec "$p" -- nvidia-smi \
+          --query-gpu=index,utilization.gpu,memory.used,memory.total \
+          --format=csv,noheader 2>/dev/null || echo "  (nvidia-smi unavailable)"
+      fi
+    done
+
+# Same, refreshed — this is what makes two P/D pools visible during strategy C.
+watch-gpus interval="2":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    while true; do clear; date +%T; just gpus; sleep {{interval}}; done
+
+# Ask the live endpoint one question (whichever strategy is serving).
+ask prompt="One sentence: why keep expert routing on NVLink?" svc="v4-flash-openai" port="8000":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    kubectl -n {{ns}} port-forward svc/{{svc}} {{port}}:8000 >/dev/null 2>&1 &
+    pf=$!; disown $pf 2>/dev/null || true; trap "kill $pf 2>/dev/null" EXIT
+    sleep 3
+    curl -s -m 300 localhost:{{port}}/v1/chat/completions -H 'content-type: application/json' \
+      -d "$(python3 -c 'import json,sys; print(json.dumps({"model":"{{model}}","messages":[{"role":"user","content":sys.argv[1]}],"max_tokens":200}))' "{{prompt}}")" \
+      | python3 -c 'import json,sys; d=json.load(sys.stdin); m=d["choices"][0]["message"]; print((m.get("content") or m.get("reasoning_content") or "").strip()); print("--", d["usage"])'
+
+# Driver log of the running RayJob (strategies A, B and C).
+logs:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    h=$(kubectl -n {{ns}} get pod -l ray.io/node-type=head -o name | head -1 | cut -d/ -f2)
+    kubectl -n {{ns}} exec "$h" -- bash -c 'tail -f $(ls -t /tmp/ray/session_latest/logs/job-driver-*.log | head -1)'
+
+# --- teardown ---------------------------------------------------------------
+# 24 GPUs across three machines. A, B and C each want 8 and D wants 16, so *some* pairs
+# coexist (C+D = 24, or A+B+C = 24) but not all four (40). The run-* recipes tear down
+# first because they measure one strategy at a time; `just stage-up` is the opposite — it
+# deliberately runs C and D together for the demo. Call these directly to free hardware.
+
+# Remove whatever strategy is serving. Keeps the RayCluster, the PVC and the weights.
+teardown:
+    -@kubectl -n {{ns}} delete rayjob --all --ignore-not-found 2>/dev/null
+    -@kubectl delete -f 30-strategy-pd-single-node.yaml --ignore-not-found 2>/dev/null
+    -@kubectl delete -f 30b-pd-proxy-fallback.yaml --ignore-not-found 2>/dev/null
+    -@kubectl delete -f 40-strategy-replicas.yaml --ignore-not-found 2>/dev/null
+    -@kubectl delete -f 40b-replicas-router.yaml --ignore-not-found 2>/dev/null
+    @just _wait-gpus-free "1"
+
+# Also delete the RayCluster — needed before strategy D, whose two replicas want
+# both machines (the Ray head holds 8 GPUs of its own; see 03).
+teardown-cluster: teardown
+    -@kubectl delete -f 03-raycluster.yaml --ignore-not-found 2>/dev/null
+    @just _wait-gpus-free "0"
+
+# Strategies A, B and C are RayJobs against the cluster in 03. `teardown-cluster` (which
+# run-d needs) deletes that cluster, so without this a later run-a/b/c applies a RayJob
+# that sits in "Initializing" forever against a cluster that no longer exists — silently,
+# until wait-ready times out 20 minutes later.
+_ensure-cluster:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    if ! kubectl -n {{ns}} get raycluster v4-flash >/dev/null 2>&1; then
+      echo "RayCluster missing (strategy D deletes it) — applying 03-raycluster.yaml"
+      kubectl apply -f 03-raycluster.yaml
+    fi
+    for i in $(seq 1 80); do
+      [ "$(kubectl -n {{ns}} get raycluster v4-flash -o jsonpath='{.status.state}' 2>/dev/null)" = "ready" ] && {
+        echo "RayCluster ready"; exit 0; }
+      sleep 15
+    done
+    echo "RayCluster did not become ready"; kubectl -n {{ns}} get pods; exit 1
+
+# Wait until at most `keep` GPU-holding pods remain in the namespace.
+_wait-gpus-free keep:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    jp='{range .items[*]}{.spec.containers[*].resources.requests.nvidia\.com/gpu}{"\n"}{end}'
+    for i in $(seq 1 60); do
+      n=$(kubectl -n {{ns}} get pods --field-selector=status.phase!=Succeeded -o jsonpath="$jp" 2>/dev/null | grep -c '[0-9]' || true)
+      if [ "${n:-0}" -le {{keep}} ]; then echo "GPU-holding pods: ${n:-0} (<= {{keep}})"; exit 0; fi
+      sleep 5
+    done
+    echo "warning: GPU pods still present after 5 min"; kubectl -n {{ns}} get pods
+
+# --- per-strategy run + measurement ----------------------------------------
+# run-* = teardown, apply the manifest, wait for the engine, measure, keep it up.
+# Cold start is minutes (weight load + kernel JIT); the JIT cache hostPaths in 03/30/40
+# make later starts much cheaper.
+#
+# ONE MEASUREMENT METHOD FOR ALL FOUR STRATEGIES: a Job inside the cluster, hitting the
+# strategy's Service by DNS. Two reasons, and it is worth being precise about which:
+#   1. `kubectl port-forward svc/...` pins to ONE pod, so it cannot measure a
+#      multi-replica Service at all. That alone settles the method question.
+#   2. Same method everywhere is the only way `just compare`'s columns mean anything.
+# What in-cluster did NOT fix: D's 424 tok/s / 36 s TTFT p95. An in-cluster run through
+# the Service reported 426.4 / 35.7 s — the same number, so the tunnel was never the cause
+# (see metrics/_archive-incluster-chunkcount-D-replicas.json).
+#
+# Warming every endpoint did not fix it either. That was the second wrong diagnosis, and
+# repeat-tour proved it: D still spanned 218 - 4417 tok/s (20x) with warmup in place. The
+# measured cause, found by benching each pod DIRECTLY instead of through the Service:
+#   pod A alone, concurrency 32 ->  190.8 tok/s, TTFT p95 40.3 s
+#   pod B alone, concurrency 32 -> 2097.9 tok/s, TTFT p95  1.2 s
+# Same image, same manifest, same node type, 8 h uptime each. One replica was serving ~11x
+# slower than the other, and its log showed TileLang kernel compiles timestamped INSIDE the
+# benchmark window (17 compiles total; the healthy pod logged 0). So a replica can pass
+# /health, serve a warmup, and still JIT-compile a new kernel shape under load — and the
+# mounted per-node cache never receives those kernels (`find /root/.tilelang -name
+# "*mhc_pre_big*"` returns 0 on both pods), so the compile can recur.
+#
+# The lesson for the harness, not just for D: a Service-level number cannot tell you that
+# one backend is sick. Measure each replica alone before believing a fleet aggregate.
+# D's aggregate is therefore NOT quotable until every replica measures the same alone.
+
+run-a: teardown _ensure-cluster && bench-a
+    kubectl apply -f 10-strategy-tep8.yaml
+
+run-b: teardown _ensure-cluster && bench-b
+    kubectl apply -f 20-strategy-dp8-ep.yaml
+
+run-c: teardown _ensure-cluster && bench-c
+    kubectl apply -f 30-strategy-pd-single-node.yaml
+
+run-d: teardown-cluster && bench-d
+    kubectl apply -f 40-strategy-replicas.yaml
+
+# The whole tour, in talk order, ending in the comparison table.
+# Separate `just` invocations on purpose: within ONE invocation just runs each recipe at
+# most once, so `run-all: run-a run-b run-c run-d` would fire `teardown` only before A —
+# B and C would then measure whatever was still serving, silently, under the wrong label.
+run-all:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for s in a b c d; do
+      echo; echo "######## strategy ${s} ########"
+      just "run-${s}"
+    done
+    just compare
+
+# --- measurement only (strategy already applied) ----------------------------
+
+# A · TEP8 — the latency shape.
+bench-a: (_bench "A-tep8" "TEP8 (RayJob)" "latency shape: attention sliced 8 ways over NVLink, whole experts per GPU" "v4-flash-openai" "32")
+
+# B · DP8 x EP (+ MegaMoE, + DSpark) — the published reference shape.
+bench-b: (_bench "B-dp8-ep" "DP8xEP + MegaMoE + DSpark" "the published reference config, widened from DP4/4xGB300" "v4-flash-openai" "32")
+
+# B without DSpark — isolates the speculator's cost on the same harness.
+bench-b-nospec: (_bench "B-dp8-ep-nospec" "DP8xEP, DSpark off" "isolates DSpark: identical to B with --speculative-config removed" "v4-flash-openai" "32")
+
+run-b-nospec: teardown _ensure-cluster && bench-b-nospec
+    kubectl apply -f 20b-strategy-dp8-ep-nospec.yaml
+
+# C · P/D disaggregation on one machine, through vllm-router.
+bench-c: (_bench "C-pd" "P/D TP4 -> DP4xEP (vllm-router)" "prefill and decode pools scale independently; KV rides NIXL over NVLink" "pd-router" "32")
+
+# C through the hand-written fallback proxy instead of vllm-router (applies 30b on demand).
+bench-c-proxy:
+    kubectl apply -f 30b-pd-proxy-fallback.yaml
+    @just _bench "C-pd-proxy" "P/D via the fallback proxy" "the minimal two-phase proxy, for comparison with vllm-router" "pd-proxy" "32"
+
+# D · whole replicas across machines. Offered load scales with the fleet: 32 per replica.
+# At a fixed 32 total, two replicas get 16 each, neither fills a batch, and aggregate comes
+# out flat vs one machine — which reads as "scale-out does nothing". It isn't; scale-out
+# buys capacity at a given latency, so the load has to grow with it.
+bench-d:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    # rollout status, not `kubectl wait -l app=...`: wait resolves the selector once and
+    # errors "no matching resources found" instead of waiting, which races the ReplicaSet
+    # controller when run-d applies the Deployment on the line before.
+    echo "waiting for the replica Deployment to roll out (cold engine start is ~20 min)"
+    kubectl -n {{ns}} rollout status deploy/v4-flash-replicas --timeout=45m
+    n=$(kubectl -n {{ns}} get pods -l app=v4-flash-replica --field-selector=status.phase=Running -o name | grep -c . )
+    [ "$n" -gt 0 ] || { echo "no replica pods — is 40-strategy-replicas.yaml applied?"; exit 1; }
+    echo "replicas: $n -> offering 32 requests per replica ($((32 * n)) total)"
+    just _bench "D-replicas" "${n}x 8xB200 replicas (Ray per replica)" "capacity scales per machine; the Service balances per connection" "v4-flash-replicas" "$((32 * n))"
+
+# D behind vllm-router instead of the bare Service — retries + per-request balancing.
+bench-d-router:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    # Wait for the REPLICAS first: the router answers as soon as one backend is healthy,
+    # so measuring right after its own rollout can silently benchmark a half-warm fleet.
+    kubectl -n {{ns}} rollout status deploy/v4-flash-replicas --timeout=45m
+    kubectl apply -f 40b-replicas-router.yaml
+    kubectl -n {{ns}} rollout status deploy/replica-router --timeout=10m
+    n=$(kubectl -n {{ns}} get pods -l app=v4-flash-replica --field-selector=status.phase=Running -o name | grep -c . )
+    just _bench "D-replicas-router" "${n}x replicas behind vllm-router" "a router balances per REQUEST and retries pre-first-token; a Service only balances per connection" "replica-router" "$((32 * n))"
+
+# Kill one replica mid-load — the strategy D failure demo, measured.
+# --runs 0 skips the single-stream pass so the kill lands inside the loaded pass; with it
+# enabled a fixed sleep fired during single-stream and the loaded pass then started against
+# an already-dead replica, which measures "requests sent to a corpse", not in-flight loss.
+# ============================ LIFECYCLE ======================================
+# wait-ready and _bench_finish were each patched three times in isolation, and
+# twice a fix introduced the next defect in the same lines: fixing a readiness gap added a
+# selector race, fixing a too-early kill produced a too-late one, fixing a wedged tunnel
+# dropped its cleanup trap. They share one control flow, so they are written together:
+#
+#   wait-ready    is the endpoint answering?        tunnel, re-established, always cleaned
+#   _bench_start  launch the Job, return at once    template only, never waits
+#   _job-wait     block until Complete|Failed|out   loud in all three cases
+#   _bench_finish _job-wait, then log -> JSON       writes only after a real Complete
+#
+# INVARIANTS, each of which broke at least once:
+#   1. every port-forward dies on every exit path, including failure and Ctrl-C
+#   2. a wedged tunnel must never be mistaken for a cold engine
+#   3. no wait ends silently — Complete, Failed and timeout all print and set exit status
+#   4. nothing writes metrics/*.json unless the Job actually reached Complete
+#   5. a fleet aggregate is not believed until each backend has been measured ALONE
+# =============================================================================
+
+# INVARIANT 5. Measure every replica on its own, bypassing the Service.
+#
+# This exists because a Service-level number cannot tell you one backend is cold, and that
+# cost THREE wrong diagnoses of strategy D — the port-forward, then "cold kernels" in
+# general, then "one pod is permanently sick". What the fleet reported as "D is bimodal,
+# 218-4417 tok/s" was one pod serving ~11x slower than its twin on an identical manifest:
+#     pod A  190.8 tok/s  TTFT p95 40.3s
+#     pod B 2097.9 tok/s  TTFT p95  1.2s
+# The third diagnosis died when the slow side MOVED after a restart — the replacement was
+# fast and the 8-hour-old pod was suddenly slow. Replacing a pod is therefore the wrong
+# reflex. The real cost is per-pod, per-request-shape and recurs after idle; bench.py's
+# warmup now fires the measured shape (not 64-token stand-ins), after which six consecutive
+# passes across both pods held 2046-2493 tok/s, a 1.22x spread.
+#
+# Run this before quoting any D number. If the two pods disagree by more than ~1.5x, the
+# fleet aggregate is noise: warm them and measure again rather than deleting anything.
+probe-d concurrency="32" max_tokens="256":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    pods=$(kubectl -n {{ns}} get pod -l app=v4-flash-replica --field-selector=status.phase=Running -o name | cut -d/ -f2)
+    [ -n "$pods" ] || { echo "no running replicas"; exit 1; }
+    mkdir -p metrics/_probe
+    for p in $pods; do
+      pf=""
+      drop() { [ -n "${pf:-}" ] && kill "$pf" 2>/dev/null; pf=""; }   # INVARIANT 1
+      trap drop EXIT INT TERM
+      kubectl -n {{ns}} port-forward "pod/$p" 8779:8000 >/dev/null 2>&1 &
+      pf=$!; sleep 5
+      printf "  %-38s " "${p}"
+      python3 bench.py --name "probe-${p##*-}" --port 8779 --runs 0 \
+        --concurrency {{concurrency}} --max-tokens {{max_tokens}} --out metrics/_probe 2>&1 \
+        | grep aggregate | sed 's/^ *//' || echo "FAILED"
+      drop
+      # a compile logged while that pod was serving is the smoking gun, so surface it
+      c=$(kubectl -n {{ns}} logs "$p" 2>/dev/null | grep -c "TileLang begins to compile")
+      [ "${c:-0}" -gt 0 ] && echo "      ^ $c TileLang compiles in this pod's log (healthy pods log 0)"
+    done
+    echo "  (metrics/_probe/ is not read by compare.py — these are diagnostics, not results)"
+
+# Readiness, then measure, then write. The only entry point bench-a/b/c/d use.
+_bench name label claim svc concurrency:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    just wait-ready 8099 "{{svc}}" || exit 1
+    just _bench_start "{{name}}" "{{label}}" "{{claim}}" "{{svc}}" "{{concurrency}}" "3" "256"
+    just _bench_finish "{{name}}" "{{svc}}" "{{concurrency}}" "3" "{{label}}" "{{claim}}"
+
+# Launch the bench Job and return immediately, so callers can poll it.
+_bench_start name label claim svc concurrency runs max_tokens="256":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    kubectl -n {{ns}} delete job bench-in-cluster --ignore-not-found >/dev/null 2>&1
+    sleep 3
+    kubectl -n {{ns}} create configmap bench-src --from-file=bench.py=bench.py \
+      --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+    sed -e "s|__NS__|{{ns}}|g" -e "s|__NAME__|{{name}}|g" -e "s|__SVC__|{{svc}}|g" \
+        -e "s|__LABEL__|{{label}}|g" -e "s|__CLAIM__|{{claim}}|g" \
+        -e "s|__RUNS__|{{runs}}|g" -e "s|__CONCURRENCY__|{{concurrency}}|g" \
+        -e "s|__MAX_TOKENS__|{{max_tokens}}|g" \
+        bench-job.yaml.tmpl | kubectl apply -f - >/dev/null
+    echo "bench Job started: svc/{{svc}} concurrency {{concurrency}} runs {{runs}} max_tokens {{max_tokens}}"
+
+# INVARIANT 3: block until one of three outcomes, and say which. `kubectl wait
+# --for=condition=complete` never matches a Failed Job, and backoffLimit is 0.
+_job-wait job cycles="240":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    for i in $(seq 1 {{cycles}}); do
+      st=$(kubectl -n {{ns}} get job {{job}} -o jsonpath='{.status.conditions[*].type}' 2>/dev/null)
+      case "$st" in
+        *Complete*) echo "{{job}}: Complete"; exit 0;;
+        *Failed*)   echo "{{job}}: FAILED"; kubectl -n {{ns}} logs job/{{job}} --tail=25; exit 1;;
+      esac
+      sleep 10
+    done
+    echo "{{job}}: reached neither Complete nor Failed in $(( {{cycles}} * 10 ))s"
+    kubectl -n {{ns}} get job {{job}} -o wide
+    kubectl -n {{ns}} logs job/{{job}} --tail=25
+    exit 1
+
+# INVARIANT 4: only a real Complete produces a metrics file.
+_bench_finish name svc concurrency runs="3" label="" claim="":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    just _job-wait bench-in-cluster || { echo "not writing metrics/{{name}}.json"; exit 1; }
+    kubectl -n {{ns}} logs job/bench-in-cluster | tail -5
+    kv=$(just _kv-tokens "{{name}}")
+    mkdir -p metrics
+    kubectl -n {{ns}} logs job/bench-in-cluster \
+      | python3 incluster_to_json.py "{{name}}" "{{svc}}" "{{concurrency}}" "{{runs}}" \
+          "${kv:-0}" "{{label}}" "{{claim}}"
+
+# KV cache capacity the engine logged, for the ONE strategy named. Takes the name because
+# it cannot be guessed:
+#   - A, B, B-nospec and C all submit RayJobs to the SAME head, so its log dir accumulates
+#     every strategy's driver log. `ls -t | head -1` returned whichever ran LAST, which made
+#     all six metrics files report an identical 24,297,851 — a row that used to discriminate
+#     (A 5.5M · B 5.0M · C 24.3M) silently became one number copied six times.
+#   - D has no head of its own, but stage-up leaves C's head running, so the old head-first
+#     branch matched and D reported C's number instead of a replica's.
+#   - C runs TWO engines logging different sizes for one manifest (24.3M vs 2.5M); the decode
+#     pool is the one holding KV during generation, so that is the one to read.
+_kv-tokens name:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    # pat = substring of the RayJob's driver log; skip = substring that must NOT match
+    # (B's glob would otherwise also match B-nospec, whose job name extends B's).
+    # An empty pat means "this strategy has no RayJob" -> read the replica pods.
+    skip=""
+    case "{{name}}" in
+      A-tep8*)          pat=tep8 ;;
+      B-dp8-ep-nospec*) pat=nospec ;;
+      B-dp8-ep*)        pat=dp8-ep; skip=nospec ;;
+      C-pd*)            pat=decode ;;
+      *)                pat="" ;;
+    esac
+    if [ -n "$pat" ]; then
+      h=$(kubectl -n {{ns}} get pod -l ray.io/node-type=head -o name 2>/dev/null | head -1 | cut -d/ -f2)
+      if [ -n "${h:-}" ]; then
+        n=$(kubectl -n {{ns}} exec -i "$h" -- bash -s -- "$pat" "$skip" 2>/dev/null <<'EOS' | grep -oE '[0-9,]+' | tr -d ,
+    pat=$1; skip=$2
+    files=$(ls -t /tmp/ray/session_latest/logs/job-driver-*"$pat"*.log 2>/dev/null)
+    [ -n "$skip" ] && files=$(printf '%s\n' "$files" | grep -v "$skip")
+    f=$(printf '%s\n' "$files" | head -1)
+    [ -n "$f" ] && grep -hoE "GPU KV cache size: [0-9,]+ tokens" "$f" 2>/dev/null | tail -1
+    EOS
+        )
+        [ -n "${n:-}" ] && { echo "$n"; exit 0; }
+      fi
+      echo "0"; exit 0        # a RayJob strategy must NOT fall through to the replicas
+    fi
+    p=$(kubectl -n {{ns}} get pod -l app=v4-flash-replica -o name 2>/dev/null | head -1 | cut -d/ -f2)
+    if [ -n "${p:-}" ]; then
+      n=$(kubectl -n {{ns}} logs "$p" 2>/dev/null | grep -hoE "GPU KV cache size: [0-9,]+ tokens" | tail -1 | grep -oE '[0-9,]+' | tr -d ,)
+      [ -n "${n:-}" ] && { echo "$n"; exit 0; }
+    fi
+    echo 0
+
+# --- stage setup (what you run BEFORE the talk) -----------------------------
+# The demo cannot start an engine: measured cold starts are 11-25 min, longer than the
+# whole slot. So bring the two VISUAL strategies up ahead of time and leave them running.
+#
+# GPU budget on 3x 8 B200 = 24:  C uses 8 (4 prefill + 4 decode on the Ray head)
+#                                D uses 16 (two replicas, one per remaining machine)
+# A and B are not live — their story is a number, and `just compare` reads numbers from
+# metrics/*.json with nothing running. A+B+C also fits 24 if you would rather show three
+# shapes than a scale-out; you cannot have all four (40 GPUs).
+
+# Bring up the demo configuration: C and D together, then warm everything.
+stage-up:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    just teardown
+    just _ensure-cluster
+    echo "=== strategy C (8 GPUs on the Ray head) ==="
+    kubectl apply -f 30-strategy-pd-single-node.yaml
+    echo "=== strategy D (16 GPUs, one replica per remaining machine) ==="
+    kubectl apply -f 40-strategy-replicas.yaml
+    echo "both applied; waiting for engines (this is the 20-25 min you are moving off stage)"
+    just wait-ready 8097 pd-router || echo "WARNING: C not ready"
+    kubectl -n {{ns}} rollout status deploy/v4-flash-replicas --timeout=45m || echo "WARNING: D not ready"
+    just warm
+    just state
+
+# Tear the stage configuration down.
+stage-down: teardown-cluster
+    @echo "stage torn down"
+
+# /health passes before the engine JIT-compiles kernels for a request shape, so a Ready
+# replica can still queue tens of seconds behind compilation the first time it generates.
+# That is what made D look capped at ~425 tok/s through two independent measurement paths.
+# Run after stage-up, and again whenever anything restarts.
+# Make every live endpoint generate once — readiness is not warmth.
+warm:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    # Reuses the in-cluster bench as the warmer (--runs 0, 64 tokens, at the concurrency
+    # each service is measured at — see below). No new code path to get wrong, and no inline
+    # python in this justfile, which has broken its parser four times.
+    n=$(kubectl -n {{ns}} get pods -l app=v4-flash-replica --field-selector=status.phase=Running -o name 2>/dev/null | grep -c . )
+    for svc in pd-router v4-flash-replicas; do
+      kubectl -n {{ns}} get svc "$svc" >/dev/null 2>&1 || continue
+      # Warm at the concurrency that service is MEASURED at: batch size keys CUDA-graph
+      # capture and MoE autotune, so warming 16-wide before a 64-wide run misses the shape.
+      c=32; [ "$svc" = "v4-flash-replicas" ] && c=$((32 * ${n:-1}))
+      echo "warming svc/$svc at concurrency $c — kernels for the shape we will ask for"
+      just _bench_start "_warm-$svc" "warmup" "warm the kernels, not just readiness" "$svc" "$c" "0" "64"
+      just _bench_finish "_warm-$svc" "$svc" "$c" "0" "warmup" "warm" || echo "  (warm pass on $svc did not finish cleanly)"
+      # leading underscore: compare.py skips _-prefixed stems, so an interrupted
+      # warm cannot leave a column behind between here and the rm below
+      rm -f "metrics/_warm-$svc.json"
+    done
+    echo "warm: every live endpoint has generated at least once"
+
+# --- repeatability ----------------------------------------------------------
+# One sample is not a measurement. This session produced 424 and 4652 tok/s from the same
+# pods minutes apart (cold kernels), and 300 vs 911 from the same manifest under two
+# harnesses (chunk- vs token-counting). Repeat, then look at the spread.
+
+# Snapshot ONE strategy's metrics into metrics/_repeat/, tagged with a round label.
+# Copying every file made stability.py report a 1.00x spread for strategies that had only
+# been measured once — a fake clean bill of health.
+_snapshot round stem:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    src="metrics/{{stem}}.json"
+    [ -f "$src" ] || { echo "no $src to snapshot"; exit 0; }
+    mkdir -p metrics/_repeat
+    cp "$src" "metrics/_repeat/{{stem}}__{{round}}.json"
+    echo "snapshot: {{stem}}__{{round}}"
+
+# Measurement variance with the engine held constant: bench N times, snapshot each.
+repeat-bench recipe stem rounds="3" tag="r":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    for i in $(seq 1 {{rounds}}); do
+      echo "=== {{recipe}} pass $i/{{rounds}} ==="
+      just {{recipe}} || { echo "{{recipe}} pass $i FAILED"; continue; }
+      just _snapshot "{{tag}}$i" "{{stem}}"
+    done
+
+# Full tour repeated N times (~1.5 h/round): engine-to-engine + measurement variance.
+repeat-tour rounds="2":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    for r in $(seq 1 {{rounds}}); do
+      echo; echo "################ ROUND $r/{{rounds}} ################"
+      just run-a        && just repeat-bench bench-a        A-tep8           2 "r${r}" || echo "A failed in round $r"
+      just run-b        && just repeat-bench bench-b        B-dp8-ep         2 "r${r}" || echo "B failed in round $r"
+      just run-b-nospec && just repeat-bench bench-b-nospec B-dp8-ep-nospec  2 "r${r}" || echo "B-nospec failed in round $r"
+      just stage-up     || echo "stage-up failed in round $r"
+      just repeat-bench bench-c C-pd        2 "r${r}" || echo "C failed in round $r"
+      just repeat-bench bench-d D-replicas  2 "r${r}" || echo "D failed in round $r"
+      just stability
+    done
+
+# Median / min / max / spread across every repeat — flags anything above 1.5x.
+stability:
+    @python3 stability.py metrics/_repeat
+
+# --- comparison -------------------------------------------------------------
+
+# Every strategy side by side, each next to the point it is meant to make.
+compare:
+    @python3 compare.py metrics
+
+# Wipe the current measurements. Keeps _archive-* runs: those are the evidence behind
+# several README and speaker-prep claims, and `rm -rf metrics` used to destroy them.
+clean-metrics:
+    -@rm -f metrics/[A-Z]*.json
+    @echo "current metrics cleared; archives kept:"; ls metrics/_archive-* 2>/dev/null | wc -l

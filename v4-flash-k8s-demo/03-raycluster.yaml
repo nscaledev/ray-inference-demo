@@ -1,0 +1,113 @@
+# 03 — The Ray cluster (KubeRay) on B200.
+# One 8x B200 machine is enough: V4-Flash fits it with room to spare, so
+# strategies A and B run entirely inside one NVLink domain. The second machine
+# stays free for the P/D pod (30-) and the replica scale-out (40-).
+#
+# Prereqs (see README): KubeRay operator, gpu-operator, prereq-node-prep.yaml,
+# and the NFS provisioner behind the `shared-nfs` class.
+#
+# The vllm image ships no ray, so 02 stages it onto the PVC at /models/ray-site
+# and the container below puts it on PATH/PYTHONPATH.
+#
+# WHY THE GPUs ARE ON THE HEAD, not a worker group:
+#   A RayJob entrypoint runs on the head pod, and `vllm serve` cannot even build
+#   its argument parser without a visible CUDA device — DeviceConfig auto-detects
+#   the platform while argparse defaults are being constructed, so a GPU-less head
+#   fails with "Failed to infer device type" before it reads a single flag. Giving
+#   the head the 8 GPUs keeps `--distributed-executor-backend ray` honest (the
+#   placement group and its 8 actors still show up in the dashboard) and leaves the
+#   whole second machine free. If you want a head + worker topology instead, the
+#   head still needs at least 1 GPU of its own — which costs you a GPU and blocks
+#   strategy C from that machine.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: v4-flash
+  namespace: v4-flash-demo
+spec:
+  rayVersion: "2.49.0"                      # must match RAY_VERSION staged by 02
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+    template:
+      spec:
+        nodeSelector:
+          nvidia.com/gpu.product: NVIDIA-B200   # control-plane VMs are tainted+tiny
+        containers:
+          - name: ray-head
+            image: vllm/vllm-openai:v0.27.1
+            resources:
+              requests:
+                nvidia.com/gpu: "8"             # the whole machine's NVLink domain
+                cpu: "64"                       # node has 192
+                memory: 512Gi                   # node has ~2015Gi allocatable
+              limits:
+                nvidia.com/gpu: "8"
+                memory: 900Gi
+            env:
+              - { name: HF_HOME, value: /models/hf-cache }
+              - { name: PYTHONPATH, value: /models/ray-site }
+              # ~10 min of every cold start is FlashInfer autotune. Pin its cache into the
+              # node-local mount below so the second start of a shape skips it, instead of
+              # trusting the default to land inside /root/.cache.
+              - { name: VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR, value: /root/.cache/flashinfer }
+              - { name: PATH, value: "/models/ray-site/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
+            ports:
+              - { containerPort: 8265, name: dashboard }
+              - { containerPort: 8000, name: openai }
+            # KubeRay's default probes shell out to `wget`, which this image does
+            # not have — the head would stay NotReady forever, keep it out of the
+            # Service endpoints, and block RayJob submission. curl is present.
+            readinessProbe:
+              exec:
+                command: ["bash", "-c", "curl -sf -m 2 localhost:52365/api/local_raylet_healthz | grep -q success && curl -sf -m 5 localhost:8265/api/gcs_healthz | grep -q success"]
+              initialDelaySeconds: 10
+              periodSeconds: 5
+              failureThreshold: 10
+            livenessProbe:
+              exec:
+                command: ["bash", "-c", "curl -sf -m 2 localhost:52365/api/local_raylet_healthz | grep -q success && curl -sf -m 5 localhost:8265/api/gcs_healthz | grep -q success"]
+              initialDelaySeconds: 30
+              periodSeconds: 5
+              failureThreshold: 120
+            volumeMounts:
+              - { name: models, mountPath: /models, readOnly: true }
+              - { name: dshm, mountPath: /dev/shm }
+              # Kernel caches. Measured: a cold engine spends ~8 min warming 1254
+              # DeepGEMM kernels plus 13 TileLang kernels, and both caches normally
+              # live inside the container (/root/.cache/{vllm,flashinfer} and
+              # /root/.tilelang), so every strategy swap paid for them again. On a
+              # node-local hostPath they survive restarts — which is what makes
+              # "switching strategies takes minutes" actually true for the demo.
+              - { name: jit-cache, mountPath: /root/.cache }
+              - { name: tilelang-cache, mountPath: /root/.tilelang }
+        volumes:
+          - name: models
+            persistentVolumeClaim: { claimName: v4-flash-models, readOnly: true }
+          - name: dshm
+            emptyDir: { medium: Memory, sizeLimit: 256Gi }
+          - name: jit-cache
+            hostPath: { path: /var/lib/v4-flash/vllm-cache, type: DirectoryOrCreate }
+          - name: tilelang-cache
+            hostPath: { path: /var/lib/v4-flash/tilelang-cache, type: DirectoryOrCreate }
+
+  # No worker group: the head owns this machine's 8 GPUs (see the note at the
+  # top), and a second GPU-less worker would add nothing. Add one only for a
+  # cross-machine experiment — and remember the fabric note in the README.
+  workerGroupSpecs: []
+
+---
+# Stable endpoint for whichever RayJob strategy is currently serving
+# (vllm serve runs on the head via the RayJob entrypoint).
+apiVersion: v1
+kind: Service
+metadata:
+  name: v4-flash-openai
+  namespace: v4-flash-demo
+spec:
+  selector:
+    ray.io/cluster: v4-flash
+    ray.io/node-type: head
+  ports:
+    - { name: openai, port: 8000, targetPort: 8000 }
+    - { name: dashboard, port: 8265, targetPort: 8265 }

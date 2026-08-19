@@ -1,0 +1,52 @@
+# PREREQ — Node prep for the B200 bare-metal pool.
+#
+# Why this exists: the Nscale g.192.b200.8 image ships mlx5_core + ib_uverbs
+# loaded but NOT ib_umad. On an NVLink5+ system the NVIDIA driver container
+# blocks forever on "waiting for the mlx5_core and ib_umad kernel modules to be
+# loaded", so nvidia.com/gpu never gets advertised and every GPU pod stays
+# Pending. Apply this BEFORE (or alongside) the gpu-operator helm install.
+#
+# DaemonSet rather than a one-shot: it also covers node reboots and the 3rd
+# node you add for the P/D strategy.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ib-umad-loader
+  namespace: v4-flash-demo
+spec:
+  selector:
+    matchLabels: { app: ib-umad-loader }
+  template:
+    metadata:
+      labels: { app: ib-umad-loader }
+    spec:
+      nodeSelector:
+        node.kubernetes.io/instance-type: g.192.b200.8
+      hostPID: true
+      containers:
+        - name: modprobe
+          image: busybox:1.36
+          securityContext: { privileged: true }
+          command: ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "--", "sh", "-c"]
+          args:
+            - |
+              # Fail LOUDLY. The obvious `modprobe ib_umad && echo ok` followed by
+              # `exec sleep infinity` masks a failure completely: the echo is skipped, the
+              # sleep still runs, the pod goes Ready, `rollout status` passes — and then the
+              # gpu-operator install hangs for its full 20 min timeout with no clue why.
+              # That is the exact confusion the comment block above exists to prevent.
+              if ! modprobe ib_umad; then
+                echo "FATAL: modprobe ib_umad failed on $(hostname)" >&2
+                echo "Without it the NVIDIA driver container's fabric manager cannot reach" >&2
+                echo "the NVLink subnet manager and no GPU will ever be schedulable." >&2
+                exit 1
+              fi
+              if ! grep -q '^ib_umad' /proc/modules; then
+                echo "FATAL: modprobe returned 0 but ib_umad is not loaded on $(hostname)" >&2
+                exit 1
+              fi
+              echo "ib_umad loaded on $(hostname)"
+              # nvidia-peermem needs ib_core symbols; gpu-operator loads it once umad is up
+              exec sleep infinity
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }

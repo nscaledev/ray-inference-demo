@@ -1,0 +1,9 @@
+# 00 — Namespace (+ optional HF token for the download job)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: v4-flash-demo
+---
+# Optional: only needed if your HF account requires auth for the repo.
+# kubectl -n v4-flash-demo create secret generic hf-token --from-literal=HF_TOKEN=hf_xxx
+# (kept out of this file on purpose — don't commit tokens)

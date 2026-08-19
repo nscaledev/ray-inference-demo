@@ -1,0 +1,27 @@
+# 01 — Shared model storage.
+# The DeepSeek-V4-Flash-0731 checkpoint ships FP4+FP8 (~200 GB class; the repo
+# totals ~304B params INCLUDING the DSpark draft module — one download covers
+# speculative decoding too). We download ONCE into this PVC; every strategy
+# mounts it read-only. Switching strategies = kubectl apply, never a re-download.
+#
+# IMPORTANT: accessMode must be ReadWriteMany — strategies C (P/D pod) and
+# D (replicas) run on different machines than the Ray worker.
+#
+# This cluster ships only `cinder` (RWO block), and cinder volumes never attach
+# to the bare-metal B200 nodes — ControllerPublishVolume just times out (they do
+# attach to the control-plane VMs). So the RWX class comes from an in-cluster
+# NFS server pinned to a control-plane VM, backed by a cinder volume; see the
+# prereq helm install in the README. Measured from a B200 node: NFS v4.1 mount
+# works over the Cilium ClusterIP, so nothing here is node-pinned.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: v4-flash-models
+  namespace: v4-flash-demo
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: shared-nfs         # the NFS provisioner installed as a prereq
+  resources:
+    requests:
+      storage: 250Gi                   # repo measures 167 GB (74 files) + ray overlay + headroom

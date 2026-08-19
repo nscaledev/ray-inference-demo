@@ -1,0 +1,106 @@
+# 30b — FALLBACK ONLY: the hand-written two-phase P/D proxy.
+#
+# NOT part of `just run-c`. Strategy C uses `vllm-router` (in 30-…yaml), the
+# standard component. This file exists for one real failure mode: both routers
+# `pip install` at pod start, so if the venue blocks PyPI you need whichever one
+# you can still get — and for the teaching value of what it cost us.
+#
+# The bug it shipped with, worth knowing: `async with httpx.AsyncClient()` inside
+# the handler closes the client when the handler RETURNS, which is before a
+# StreamingResponse has finished reading it. Measured on 8x B200: 18 of 32
+# concurrent requests failed with RemoteDisconnected, aggregate 96 tok/s, and TPOT
+# read as 0.01 ms because responses arrived in one lump. Module-scope client +
+# client.stream(): 1670 tok/s, 0 failures. A 17x swing from one `async with`.
+#
+#   kubectl apply -f 30b-pd-proxy-fallback.yaml
+#   just bench-c-proxy          # measures through it on :8081
+---
+# FALLBACK, kept for teaching: the minimal two-phase proxy.
+# Only needed if you can't pull vllm-router. Send the prompt to prefill (max_tokens=1) to build the
+# cache, then replay against decode; NIXL moves the KV + indexer cache between
+# the pools. Mirrors vLLM's disaggregated-serving example proxy — swap in your
+# production router for real traffic.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pd-proxy-src
+  namespace: v4-flash-demo
+data:
+  proxy.py: |
+    import os
+    from urllib.parse import urljoin
+    import httpx
+    from fastapi import FastAPI, Request
+    from fastapi.responses import StreamingResponse, JSONResponse
+
+    PREFILL = os.environ["PREFILL_URL"]
+    DECODE  = os.environ["DECODE_URL"]
+
+    # One long-lived client. The obvious version — `async with
+    # httpx.AsyncClient()` inside the handler — closes the client when the
+    # handler returns, which happens BEFORE a StreamingResponse has finished
+    # reading. That shows up as RemoteDisconnected on most requests under
+    # concurrency (measured: 18 of 32 failed), so keep the client at module
+    # scope and give it a pool big enough for the load you intend to send.
+    limits = httpx.Limits(max_connections=256, max_keepalive_connections=64)
+    client = httpx.AsyncClient(timeout=None, limits=limits)
+    app = FastAPI()
+
+    @app.get("/v1/models")
+    async def models():
+        r = await client.get(urljoin(DECODE, "/v1/models"))
+        return JSONResponse(r.json(), status_code=r.status_code)
+
+    @app.post("/v1/{path:path}")
+    async def route(path: str, request: Request):
+        body = await request.json()
+        # phase 1 — prefill builds the KV; NIXL hands it to the decode pool
+        pre = dict(body, max_tokens=1, stream=False)
+        r = await client.post(urljoin(PREFILL, f"/v1/{path}"), json=pre)
+        r.raise_for_status()
+        # phase 2 — decode, streamed through so TPOT stays measurable end to end
+        if body.get("stream"):
+            async def relay():
+                async with client.stream("POST", urljoin(DECODE, f"/v1/{path}"),
+                                         json=body) as resp:
+                    async for chunk in resp.aiter_raw():
+                        yield chunk
+            return StreamingResponse(relay(), media_type="text/event-stream")
+        r2 = await client.post(urljoin(DECODE, f"/v1/{path}"), json=body)
+        return JSONResponse(r2.json(), status_code=r2.status_code)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pd-proxy
+  namespace: v4-flash-demo
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: pd-proxy } }
+  template:
+    metadata: { labels: { app: pd-proxy } }
+    spec:
+      containers:
+        - name: proxy
+          image: python:3.12-slim
+          command: ["bash", "-lc"]
+          args:
+            - pip install -q fastapi uvicorn httpx &&
+              uvicorn proxy:app --host 0.0.0.0 --port 8000 --app-dir /app
+          env:
+            - { name: PREFILL_URL, value: "http://pd-pools:8100" }
+            - { name: DECODE_URL,  value: "http://pd-pools:8200" }
+          ports: [{ containerPort: 8000 }]
+          volumeMounts: [{ name: src, mountPath: /app }]
+      volumes:
+        - name: src
+          configMap: { name: pd-proxy-src }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pd-proxy
+  namespace: v4-flash-demo
+spec:
+  selector: { app: pd-proxy }
+  ports: [{ port: 8000, targetPort: 8000 }]

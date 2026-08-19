@@ -1,0 +1,88 @@
+# 02 — One-time model download into the shared PVC.
+# Idempotent: re-applying is a no-op once the sentinel file exists.
+#
+#   kubectl apply -f 02-model-download-job.yaml
+#   kubectl -n v4-flash-demo logs -f job/v4-flash-download
+#
+# Two things land on the PVC:
+#   /models/DeepSeek-V4-Flash-0731   the checkpoint (167 GB, DSpark draft inside)
+#   /models/ray-site                 ray, which the vllm image does NOT ship
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: v4-flash-download
+  namespace: v4-flash-demo
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: v4-flash-download
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: download
+          image: vllm/vllm-openai:v0.27.1   # pin: released tag with dspark + deep_gemm_mega_moe (cu129, fine on driver 580)
+          command: ["bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+
+              # --- ray ---------------------------------------------------------
+              # Checked inside this image: no `ray` binary, no ray module. KubeRay's
+              # containers just crashloop with "ray: command not found", so stage it
+              # onto the PVC once and let 03 put it on PATH/PYTHONPATH. Anything the
+              # image already provides is pruned from the overlay so we never shadow
+              # vllm's own pinned deps (grpcio, protobuf, pydantic...).
+              if [ ! -x /models/ray-site/bin/ray ]; then
+                echo "staging ray ${RAY_VERSION} onto the PVC"
+                # uv resolves this in seconds; pip backtracks for many minutes
+                command -v uv >/dev/null && PIP="uv pip" || PIP="python3 -m pip"
+                $PIP install -q --target /models/ray-site "ray[default]==${RAY_VERSION}"
+                python3 - <<'PY'
+              import pathlib, shutil, site
+              image = {p.name
+                       for d in site.getsitepackages() if pathlib.Path(d).is_dir()
+                       for p in pathlib.Path(d).iterdir()}
+              for p in pathlib.Path("/models/ray-site").iterdir():
+                  if p.name in image and not p.name.startswith("ray"):
+                      shutil.rmtree(p) if p.is_dir() else p.unlink()
+                      print("pruned duplicate", p.name)
+              PY
+                PYTHONPATH=/models/ray-site /models/ray-site/bin/ray --version
+              fi
+
+              # --- weights -----------------------------------------------------
+              if [ -f /models/DeepSeek-V4-Flash-0731/.download-complete ]; then
+                echo "DeepSeek-V4-Flash-0731 already present on PVC — nothing to do."
+                exit 0
+              fi
+              export HF_HUB_ENABLE_HF_TRANSFER=1     # present in this image
+              echo "Downloading deepseek-ai/DeepSeek-V4-Flash-0731 (167 GB, FP4+FP8, DSpark draft included)..."
+              python3 - <<'PY'
+              from huggingface_hub import snapshot_download
+              snapshot_download("deepseek-ai/DeepSeek-V4-Flash-0731",
+                                local_dir="/models/DeepSeek-V4-Flash-0731",
+                                max_workers=16)
+              PY
+              touch /models/DeepSeek-V4-Flash-0731/.download-complete
+              df -h /models
+              echo "Done. The DSpark speculator is INSIDE this checkpoint — no second download."
+          env:
+            # Uncomment if the repo needs auth (it is public, but a token lifts the
+            # unauthenticated rate limit):
+            # - name: HF_TOKEN
+            #   valueFrom:
+            #     secretKeyRef: { name: hf-token, key: HF_TOKEN }
+            - name: HF_HOME
+              value: /models/hf-cache
+            - name: RAY_VERSION
+              value: "2.49.0"                 # keep in sync with 03's rayVersion
+          resources:
+            requests: { cpu: "16", memory: 32Gi }
+          volumeMounts:
+            - { name: models, mountPath: /models }
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: v4-flash-models

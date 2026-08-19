@@ -1,0 +1,103 @@
+# 40b — OPTIONAL front door for strategy D: vllm-router instead of a bare Service.
+#
+# NOT applied by `just run-d`. Apply it when you want to answer "what happens to a
+# request when a replica dies?" with something better than "it fails".
+#
+# What the bare Service gives you: connection-level load balancing and endpoint removal
+# when a pod goes NotReady. What it cannot give you: a retry. A Service has no idea a
+# request failed — it only routes new connections.
+#
+# What the router adds (all on by default in vllm-project/router):
+#   --retry-max-retries 5, exponential backoff + jitter   -> a request that fails BEFORE
+#     the first token is re-sent to a healthy replica; the caller never sees the failure
+#   circuit breaker (cb-failure-threshold / cb-timeout-duration-secs) -> a replica that
+#     keeps failing is taken out of rotation instead of eating one retry per request
+#   health checks (--health-check-interval-secs, /health) -> dead replicas leave rotation
+#     even if Kubernetes still lists them as endpoints
+#
+# The limit worth being honest about: retries key off the HTTP response status
+# (`is_retryable_status`), so they apply before the body starts streaming. Once a 200 and
+# some tokens are on the wire, a mid-stream kill truncates that response and no proxy can
+# resume it — that is the client's retry to make. Graceful drain in 40- covers the
+# planned case; this covers the unplanned-but-fast-failing case; together they leave only
+# "machine lost power mid-token" unhandled.
+#
+#   kubectl apply -f 40b-replicas-router.yaml
+#   just bench-d-router          # measures through the router instead of the Service
+---
+# Service discovery needs to list/watch the replica pods.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vllm-router
+  namespace: v4-flash-demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vllm-router-discovery
+  namespace: v4-flash-demo
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vllm-router-discovery
+  namespace: v4-flash-demo
+subjects:
+  - kind: ServiceAccount
+    name: vllm-router
+    namespace: v4-flash-demo
+roleRef:
+  kind: Role
+  name: vllm-router-discovery
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: replica-router
+  namespace: v4-flash-demo
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: replica-router } }
+  template:
+    metadata: { labels: { app: replica-router } }
+    spec:
+      serviceAccountName: vllm-router
+      containers:
+        - name: router
+          image: python:3.12-slim
+          command: ["bash", "-lc"]
+          args:
+            - |
+              pip install -q vllm-router &&
+              exec vllm-router \
+                --service-discovery \
+                --selector app=v4-flash-replica \
+                --service-discovery-namespace v4-flash-demo \
+                --service-discovery-port 8000 \
+                --policy round_robin \
+                --retry-max-retries 5 \
+                --request-timeout-secs 1800 \
+                --health-check-interval-secs 10 \
+                --host 0.0.0.0 --port 8000
+          ports: [{ containerPort: 8000 }]
+          readinessProbe:
+            tcpSocket: { port: 8000 }
+            initialDelaySeconds: 20
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "2", memory: 4Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: replica-router
+  namespace: v4-flash-demo
+spec:
+  selector: { app: replica-router }
+  ports: [{ port: 8000, targetPort: 8000 }]

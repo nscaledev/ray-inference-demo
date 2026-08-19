@@ -1,0 +1,40 @@
+# Template for the in-cluster bench Job. `just` substitutes the __PLACEHOLDERS__ with sed
+# rather than embedding YAML-in-python-in-just, which broke the justfile parser twice.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bench-in-cluster
+  namespace: __NS__
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: bench
+          image: python:3.12-slim
+          command: ["python3", "/src/bench.py"]
+          args:
+            - "--name"
+            - "__NAME__"
+            - "--host"
+            - "__SVC__"
+            - "--port"
+            - "8000"
+            - "--label"
+            - "__LABEL__"
+            - "--claim"
+            - "__CLAIM__"
+            - "--runs"
+            - "__RUNS__"
+            - "--concurrency"
+            - "__CONCURRENCY__"
+            - "--max-tokens"
+            - "__MAX_TOKENS__"
+            - "--out"
+            - "/tmp/metrics"
+          volumeMounts:
+            - { name: src, mountPath: /src }
+      volumes:
+        - name: src
+          configMap: { name: bench-src }
