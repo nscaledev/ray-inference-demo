@@ -1,3 +1,40 @@
+# ============================ TP4 IS SILENTLY WRONG =========================================
+#
+# THE FINDING, isolated on an idle machine with no NIXL, no contention, no router:
+#   --tensor-parallel-size 4 produces CORRUPT OUTPUT for DeepSeek-V4-Flash on vLLM v0.27.1.
+#
+#     Q: "What is 2+2? Reply with only the number."
+#     A: ' \u2014package: " + packageName);\n        }\n        return packageName;'
+#     Q: "What is the capital of France? One word."
+#     A: '\npackage ict.written.x2013;\r\nimport java.util.ArrayList;'
+#
+#   No error. No warning. HTTP 200, fluent-looking tokens, Java package declarations.
+#
+#   TP8 is correct (strategy A, strategy D, the 1M engine in 50-).
+#   DP4 x EP is correct (this file's decode pool).
+#   TP4 is not.
+#
+# WHY THAT MATTERS HERE: the obvious way to put two pools on one 8-GPU machine is 4 + 4, and
+# TP4 is the obvious way to shard four GPUs. It is quietly broken, so a P/D demo built the
+# obvious way emits nonsense at full speed. The router then inherits it, because the decode
+# pool is fed a KV cache computed by a broken engine.
+#
+# THREE FIXES THAT DID NOTHING, in order, before the cause was isolated:
+#   1. kv_role: kv_both -> kv_producer/kv_consumer. vLLM deprecation-warns about kv_both, so
+#      this looked like the answer. It is a real bug and worth fixing; it is not this one.
+#   2. Matching both pools to DP4 x EP. Correct instinct, but two DP+EP engines on one node
+#      both bind the MoE data-parallel coordinator port -> zmq "Address already in use".
+#   3. enable_permute_local_kv: true, the NixlConnector flag that exists to reconcile
+#      different local KV layouts. Also nothing, because the layout was never the problem.
+#   The lesson: the log handed me a plausible warning and I chased it three times instead of
+#   isolating the one variable that mattered. Ask the engine a question you know the answer to
+#   BEFORE theorising about transport.
+#
+# HOW THIS WENT UNNOTICED FOR HOURS: `just compare` showed C at 1,703.9 tok/s with 0 failed
+# requests across 22 benchmark runs. bench.py counted tokens and never read one. That is why
+# bench.py now asks "What is 2+2?" at temperature 0 before it times anything, and why
+# metrics/*.json carries output_sane.
+#
 # BOTH POOLS MUST SHARE A PARALLELISM SHAPE, or NIXL ships KV one layout and the other
 # side reads it as another. Measured, after asking the pools a question rather than only
 # timing them:
@@ -53,10 +90,14 @@ spec:
   # submitter pod — which matters because this image has no ray to submit with.
   submissionMode: HTTPMode
   entrypoint: >-
+    VLLM_DP_MASTER_PORT=29700
     vllm serve /models/DeepSeek-V4-Flash-0731
     --served-model-name deepseek-ai/DeepSeek-V4-Flash-0731
     --distributed-executor-backend ray
-    --tensor-parallel-size 4
+    --data-parallel-size 4
+    --data-parallel-backend ray
+    --enable-expert-parallel
+    --data-parallel-rpc-port 29750
     --trust-remote-code
     --kv-cache-dtype fp8
     --block-size 256

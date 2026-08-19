@@ -130,6 +130,34 @@ Three candidate images all claim V4-Flash support and none are interchangeable. 
 **Never compare numbers across these images** — the same manifest gave a 45× different KV
 budget between builds, which is how a "45× TP-vs-DP finding" turned out to be an artefact.
 
+## A finding worth more than the strategy: TP4 is silently wrong
+
+Isolated on an idle machine, no NIXL, no router, no contention:
+
+```
+--tensor-parallel-size 4, DeepSeek-V4-Flash, vLLM v0.27.1
+  Q: "What is 2+2? Reply with only the number."
+  A: " —package: \" + packageName);\n        }\n        return packageName;"
+```
+
+HTTP 200. Fluent tokens. Java package declarations. No error, no warning.
+
+**TP8 is correct** (A, D, the 1M engine). **DP4×EP is correct** (C's decode pool). **TP4 is
+not.** Which matters because the obvious way to put two pools on one 8-GPU machine is 4+4,
+and the obvious way to shard four GPUs is TP4 — so a P/D demo built the obvious way emits
+nonsense at full speed, and the router inherits it from the KV cache.
+
+It survived **22 benchmark runs at 1,703.9 tok/s with 0 failures**, because the harness
+counted tokens and never read one. `bench.py` now asks a question with a known answer before
+it times anything, `output_sane` is recorded in every metrics file, and `just compare` refuses
+the column outright when it is false. If you take one thing from this repo, take that: a
+throughput benchmark cannot tell you the output is wrong.
+
+Three fixes that did nothing first — `kv_role` producer/consumer (a real bug, not this one),
+matching both pools to DP4×EP (blocked: two DP+EP engines on one node collide on the MoE
+coordinator port), and `enable_permute_local_kv`. The log offered a plausible warning and it
+got chased three times instead of isolating the one variable that mattered.
+
 ## The 1M window
 
 Strategies A–D all serve `--max-model-len 262144`. That is a deliberate setting, not a

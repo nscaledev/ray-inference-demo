@@ -620,7 +620,10 @@ _longctx-run tokens depth:
         longctx-job.yaml.tmpl | kubectl apply -f - >/dev/null
     just _job-wait longctx-in-cluster 1200 || {
       kubectl -n {{ns}} logs job/longctx-in-cluster --tail=8 2>/dev/null; exit 1; }
-    kubectl -n {{ns}} logs job/longctx-in-cluster 2>/dev/null | grep -E "prompt_tokens|REJECTED|NO CONTENT|UNREACHABLE|target"
+    # The Job runs only longctx.py, so its whole stdout is ours. An allow-list of lines
+    # silently ate the "-> POST / model= / prompt[...]" echo, which exists precisely so the
+    # audience can see the request. Show everything instead.
+    kubectl -n {{ns}} logs job/longctx-in-cluster 2>/dev/null | sed 's/^/  /'
 
 # The depth sweep is the part that actually tests CSA: a model attending only to the head and
 # tail of its window still passes a needle test at depth 0.0 or 1.0.
@@ -636,7 +639,7 @@ longctx-sweep:
       | tail -2 | sed 's/^/  /'
     echo "=== TTFT vs context length (needle at mid-depth) ==="
     for n in 128000 250000 500000 1000000; do
-      just _longctx-run "$n" 0.5 | grep -E "prompt_tokens|REJECTED|NO CONTENT|UNREACHABLE" | sed 's/^/  /' || true
+      just _longctx-run "$n" 0.5 | grep -E "POST|prompt\[|prompt_tokens|REJECTED|NO CONTENT|UNREACHABLE" || true
     done
     echo "=== needle depth sweep at 1M — head, middle and tail ==="
     for d in 0.05 0.25 0.5 0.75 0.95; do
