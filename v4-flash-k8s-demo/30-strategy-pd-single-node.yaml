@@ -1,3 +1,14 @@
+# ============================================================================================
+# THIS MANIFEST DOES NOT PRODUCE CORRECT OUTPUT ON THIS STACK. It is kept as the finding, not
+# as a working strategy. `just bench-c` will now fail its output-sanity check and `just compare`
+# will refuse the column, which is the intended behaviour -- do not "fix" that by removing the
+# check. On a single 8-GPU machine the two available 4+4 splits are:
+#     TP4 prefill  -> silently wrong output (see below)
+#     DP4xEP both  -> will not start (fixed coordinator port, see below)
+# so P/D on one machine is not available here. It works fine across two machines, where each
+# pool gets 8 GPUs and can use the TP8 shape that is known-correct.
+# ============================================================================================
+#
 # ============================ TP4 IS SILENTLY WRONG =========================================
 #
 # THE FINDING, isolated on an idle machine with no NIXL, no contention, no router:
@@ -22,8 +33,11 @@
 # THREE FIXES THAT DID NOTHING, in order, before the cause was isolated:
 #   1. kv_role: kv_both -> kv_producer/kv_consumer. vLLM deprecation-warns about kv_both, so
 #      this looked like the answer. It is a real bug and worth fixing; it is not this one.
-#   2. Matching both pools to DP4 x EP. Correct instinct, but two DP+EP engines on one node
-#      both bind the MoE data-parallel coordinator port -> zmq "Address already in use".
+#   2. Matching both pools to DP4 x EP. Correct instinct, and the only remaining route, but
+#      two DP+EP engines on one node both bind tcp://<head>:5600 and the second dies with
+#      zmq "Address already in use". That port is NOT VLLM_DP_MASTER_PORT and NOT
+#      --data-parallel-rpc-port: both were set to unused values (29700 / 29750) and the
+#      collision was byte-identical. It is fixed inside the MegaMoE DP path with no knob.
 #   3. enable_permute_local_kv: true, the NixlConnector flag that exists to reconcile
 #      different local KV layouts. Also nothing, because the layout was never the problem.
 #   The lesson: the log handed me a plausible warning and I chased it three times instead of
@@ -90,14 +104,10 @@ spec:
   # submitter pod — which matters because this image has no ray to submit with.
   submissionMode: HTTPMode
   entrypoint: >-
-    VLLM_DP_MASTER_PORT=29700
     vllm serve /models/DeepSeek-V4-Flash-0731
     --served-model-name deepseek-ai/DeepSeek-V4-Flash-0731
     --distributed-executor-backend ray
-    --data-parallel-size 4
-    --data-parallel-backend ray
-    --enable-expert-parallel
-    --data-parallel-rpc-port 29750
+    --tensor-parallel-size 4
     --trust-remote-code
     --kv-cache-dtype fp8
     --block-size 256
