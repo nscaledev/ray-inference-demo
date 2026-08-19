@@ -187,6 +187,72 @@ logs:
     h=$(kubectl -n {{ns}} get pod -l ray.io/node-type=head -o name | head -1 | cut -d/ -f2)
     kubectl -n {{ns}} exec "$h" -- bash -c 'tail -f $(ls -t /tmp/ray/session_latest/logs/job-driver-*.log | head -1)'
 
+
+# --- ask one named strategy, and prove it is that strategy -------------------------------
+# A, B and B-DSpark are all RayJobs on the SAME Service (v4-flash-openai:8000), so a bare
+# `just ask` cannot tell you which of them answered. An `ask-a` that silently answers from B
+# would be a new way to mislead, so each of these refuses unless the strategy it names is the
+# one actually serving. `just ask` already echoes the request and prints the reply; these add
+# the label and the guard.
+_ask-strategy label want svc port prompt temp="1.0":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    case "{{want}}" in
+      deploy/*)
+        n=$(kubectl -n {{ns}} get {{want}} -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)
+        [ "${n:-0}" -ge 1 ] || { echo "REFUSING: {{label}} is not serving — {{want}} has ${n:-0} ready replicas"; exit 1; } ;;
+      *)
+        st=$(kubectl -n {{ns}} get rayjob {{want}} -o jsonpath='{.status.jobStatus}' 2>/dev/null || true)
+        [ "$st" = "RUNNING" ] || { echo "REFUSING: {{label}} is not serving — rayjob {{want}} is '${st:-absent}'"; exit 1; } ;;
+    esac
+    echo "──── {{label}} ────"
+    just ask "{{prompt}}" "{{svc}}" "{{port}}" "{{temp}}"
+
+[doc("Ask strategy A and show the exchange (refuses unless A is serving)")]
+ask-a prompt="In one sentence: why keep expert routing inside the NVLink domain?":
+    @just _ask-strategy "A · TEP8 (TP8 + EP)" serve-tep8 v4-flash-openai 8000 "{{prompt}}"
+
+[doc("Ask strategy B and show the exchange (refuses unless B is serving)")]
+ask-b prompt="In one sentence: what does speculative decoding change about decode?":
+    @just _ask-strategy "B · DP8xEP + MegaMoE + DSpark" serve-dp8-ep v4-flash-openai 8000 "{{prompt}}"
+
+[doc("Ask B-without-DSpark and show the exchange")]
+ask-b-nospec prompt="In one sentence: what is expert parallelism?":
+    @just _ask-strategy "B - DSpark (DP8xEP + MegaMoE)" serve-dp8-ep-nospec v4-flash-openai 8000 "{{prompt}}"
+
+[doc("Ask strategy C through the P/D router (expected to FAIL the sanity check — see 30-)")]
+ask-c prompt="What is 2+2? Reply with only the number.":
+    @just _ask-strategy "C · P/D 4+4 via vllm-router" serve-pd-decode pd-router 8000 "{{prompt}}" 0.0
+
+[doc("Ask strategy D through the replica Service")]
+ask-d prompt="In one sentence: what does scaling out with whole replicas buy you?":
+    @just _ask-strategy "D · replicas" deploy/v4-flash-replicas v4-flash-replicas 8000 "{{prompt}}"
+
+[doc("Ask the 1M-window engine and show the exchange")]
+ask-1m prompt="In one sentence: why does a longer context cost cache rather than compute?":
+    @just _ask-strategy "1M window (TP8 + EP, max-model-len 1048576)" deploy/v4-flash-longctx v4-flash-longctx 8000 "{{prompt}}"
+
+[doc("Ask EVERY live endpoint questions with known answers — PASS/FAIL per endpoint")]
+verify-output:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    # The anti-lying tool. Throughput cannot report incorrectness; only reading an answer can.
+    # This is what caught TP4 returning Java package declarations at 1,703.9 tok/s.
+    live=$(just _endpoints)
+    [ -n "$live" ] || { echo "nothing is serving"; exit 1; }
+    fails=0
+    echo "$live" | while read -r svc port; do
+      printf "  %-22s " "$svc:$port"
+      out=$(just ask "What is 2+2? Reply with only the number." "$svc" "$port" 0.0 2>/dev/null \
+            | grep -v "^→ POST\|^    model=\|^    prompt\[\|^--" | tr '\n' ' ')
+      case "$out" in
+        *4*) echo "PASS   $(echo "$out" | cut -c1-60)" ;;
+        *)   echo "FAIL   $(echo "$out" | cut -c1-60)"; fails=1 ;;
+      esac
+    done
+    echo
+    echo "  A FAIL means that engine's throughput number describes wrong answers. Do not quote it."
+
 # --- teardown ---------------------------------------------------------------
 # 24 GPUs across three machines. A, B and C each want 8 and D wants 16, so *some* pairs
 # coexist (C+D = 24, or A+B+C = 24) but not all four (40). The run-* recipes tear down
