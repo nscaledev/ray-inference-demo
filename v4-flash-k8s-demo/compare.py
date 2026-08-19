@@ -93,10 +93,18 @@ def main():
     print()
     print("MEASURED".ljust(label_w) + "".join(c[1][:col_w - 1].ljust(col_w) for c in cols))
     print("-" * (label_w + col_w * len(cols)))
+    # A column that failed the output-sanity check has its TIMINGS BLANKED, not merely
+    # footnoted. The number on screen is what gets read out loud, so a caveat printed below
+    # the table loses to a throughput figure printed inside it. Only the sanity row and the
+    # shape rows stay visible, which is exactly enough to see why it is blanked.
+    KEEP_WHEN_INSANE = {"concurrency", "endpoints", "KV cache (tokens)", "output sane (2+2)"}
     for name, getter, unit in FIELDS:
         row = name.ljust(label_w)
         for stem, _ in cols:
-            row += cell(data[stem], getter, unit).ljust(col_w)
+            insane = data[stem].get("output_sane") is False
+            value = ("✗" if insane and name not in KEEP_WHEN_INSANE
+                     else cell(data[stem], getter, unit))
+            row += value.ljust(col_w)
         print(row)
 
     print("\nTHE POINT")
@@ -125,7 +133,8 @@ def main():
               "multi-replica strategy that means 32 per replica, not 32 in total.")
     bad = [s for s, _ in cols if data[s].get("output_sane") is False]
     if bad:
-        print(f"\n⛔ {', '.join(bad)} FAILED the output-sanity check: the engine answered 2+2 "
+        print(f"\n⛔ {', '.join(bad)} FAILED the output-sanity check — timings above are shown "
+              f"as ✗ rather than as numbers. The engine answered 2+2 "
               "wrongly, so its throughput is the throughput of garbage. Do not quote it. This "
               "happened for real — a P/D prefill pool with kv_role=kv_both returned 200s full "
               "of nonsense while this table showed it at 1,703.9 tok/s.")

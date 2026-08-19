@@ -111,7 +111,7 @@ wait-ready port="8000" svc="v4-flash-openai" budget="540":
         # first request of an unseen shape. So prove it can GENERATE before saying ready;
         # otherwise a flow proceeds to measure an engine that is minutes from serving at speed.
         echo "endpoint answering after ~$((i * 5))s; checking it can generate"
-        body=$(python3 make_request.py "{{model}}" "ping" 1 "localhost:{{port}}/v1/chat/completions")
+        body=$(python3 make_request.py "{{model}}" "ping" 1 "localhost:{{port}}/v1/chat/completions" 0.0)
         if curl -sf -m 120 "localhost:{{port}}/v1/chat/completions" \
              -H 'content-type: application/json' -d "$body" 2>/dev/null | grep -q '"choices"'; then
           echo "ready: generated after ~$((i * 5))s"
@@ -157,7 +157,7 @@ watch-gpus interval="2":
 
 # Ask the live endpoint one question (whichever strategy is serving).
 [doc("Ask whichever endpoint is serving one question, and print the answer")]
-ask prompt="One sentence: why keep expert routing on NVLink?" svc="" port="8000":
+ask prompt="One sentence: why keep expert routing on NVLink?" svc="" port="8000" temp="1.0":
     #!/usr/bin/env bash
     set -uo pipefail
     # svc="" means "whatever is serving". The old default was a hardcoded Service that is
@@ -173,7 +173,9 @@ ask prompt="One sentence: why keep expert routing on NVLink?" svc="" port="8000"
     [ -z "$probe" ] && probe=$(kubectl -n {{ns}} get pods -l app=v4-flash-longctx --field-selector=status.phase=Running -o name 2>/dev/null | head -1 | cut -d/ -f2)
     [ -z "$probe" ] && { echo "no vLLM pod to ask from"; exit 1; }
     # make_request.py prints the call on stderr (visible) and the JSON body on stdout.
-    body=$(python3 make_request.py "{{model}}" "{{prompt}}" 200 "http://$svc:$port/v1/chat/completions")
+    # temp defaults to the model card's 1.0 for the live beat; pass 0.0 to use this as a
+    # diagnostic (greedy decoding on a model specified for 1.0 tends to read repetitive).
+    body=$(python3 make_request.py "{{model}}" "{{prompt}}" 200 "http://$svc:$port/v1/chat/completions" "{{temp}}")
     kubectl -n {{ns}} exec "$probe" -- curl -s -m 300 "http://$svc:$port/v1/chat/completions" -H 'content-type: application/json' -d "$body" > /tmp/just-ask.json 2>/dev/null
     python3 show_answer.py /tmp/just-ask.json
 

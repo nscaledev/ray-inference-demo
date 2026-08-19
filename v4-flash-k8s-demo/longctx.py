@@ -65,23 +65,24 @@ def build(tokens, depth, secret, tag):
     )
 
 
-# Duplicated in bench.py, longctx.py and make_request.py on purpose: the in-cluster Jobs mount
-# a ConfigMap containing exactly ONE file, so a shared module would not be present at runtime.
-# Six lines beats adding a second --from-file to two Job templates.
-def describe_call(url, body, prompt_key="messages", limit=100):
+# Copied verbatim into longctx.py and make_request.py. This file and longctx.py run in-cluster
+# from a ConfigMap holding exactly ONE file, so a shared module would not exist at runtime --
+# that is the real constraint. make_request.py runs on the laptop and copies only to stay
+# identical; keep the three in sync or delete two of them, but do not let them drift again.
+def describe_call(url, body, limit=100):
     """One auditable line per API call: what was sent, where, with the prompt trimmed.
 
-    Printed so the audience can see the demo is a plain OpenAI-compatible POST and nothing is
-    hidden in the harness — the whole talk asks people to rerun this, so the request has to be
+    Printed so the audience can see the demo is a plain OpenAI-compatible POST with nothing
+    hidden in the harness — the talk asks people to rerun this, so the request has to be
     visible. Newlines are collapsed and the prompt is truncated to `limit` chars with its true
     length shown, because a 1M-token prompt is ~5.8 MB and must never be echoed in full.
     """
-    msgs = body.get(prompt_key) or []
+    msgs = body.get("messages") or []
     prompt = (msgs[0].get("content", "") if msgs else "")
     flat = " ".join(prompt.split())
-    shown = flat[:limit] + ("…" if len(flat) > limit else "")
+    shown = flat[:limit] + ("\u2026" if len(flat) > limit else "")
     opts = " ".join(f"{k}={body[k]}" for k in ("max_tokens", "temperature", "stream") if k in body)
-    return (f"→ POST {url}\n"
+    return (f"\u2192 POST {url}\n"
             f"    model={body.get('model')} {opts}\n"
             f'    prompt[{len(prompt):,} chars]: "{shown}"')
 

@@ -21,9 +21,10 @@ PROMPT = (
 )
 
 
-# Duplicated in bench.py, longctx.py and make_request.py on purpose: the in-cluster Jobs mount
-# a ConfigMap containing exactly ONE file, so a shared module would not be present at runtime.
-# Six lines beats adding a second --from-file to two Job templates.
+# Copied verbatim into longctx.py and make_request.py. This file and longctx.py run in-cluster
+# from a ConfigMap holding exactly ONE file, so a shared module would not exist at runtime --
+# that is the real constraint. make_request.py runs on the laptop and copies only to stay
+# identical; keep the three in sync or delete two of them, but do not let them drift again.
 def describe_call(url, body, limit=100):
     """One auditable line per API call: what was sent, where, with the prompt trimmed.
 
@@ -288,6 +289,13 @@ def main():
         "label": args.label,
         "claim": args.claim,
         "model": args.model,
+        # Recorded, not just printed. incluster_to_json.py scrapes the printed line for the
+        # in-cluster route, but this file is also written directly when bench.py runs from a
+        # laptop (see the docstring) -- and a MISSING output_sane reads in compare.py as
+        # "predates the check", a mild note, where a recorded False triggers the outright
+        # refusal. So the laptop route was the one that downgraded a garbage engine.
+        "output_sane": ok,
+        "sanity_answer": answer,
         "max_tokens": args.max_tokens,
         "kv_cache_tokens": args.kv_tokens or None,
         "single_stream": single,
