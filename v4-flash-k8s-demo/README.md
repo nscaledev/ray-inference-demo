@@ -234,7 +234,7 @@ Talking points: TP4 prefill (GPUs 0–3) → DP4×EP decode (GPUs 4–7); NIXL m
 paged KV + the indexer cache between pools per request; different pool shapes,
 one connector. `watch nvidia-smi` on the node makes the two pools visible.
 
-### 4. Strategy D — replicas across machines + failure
+### 4. Strategy D — replicas across machines (measured, not demoed)
 
 `40-` replicates **strategy A's** shape, not B's: replication multiplies whatever you put in
 it (measured close to linear per machine), so replicating the slower config produced less on
@@ -252,17 +252,20 @@ Three layers decide whether a dying replica loses requests:
 3. **Client retry**: the only cure once a 200 and some tokens are already on the wire.
    No proxy can resume someone else's half-sent stream.
 
+**Not part of the live demo.** *Add machines, get throughput* is self-evident, so it does not
+earn stage time — the 1M window took that slot. The non-obvious part of D is which shape you
+replicate, and that is one sentence off the results slide. Reproduce it any time:
+
 ```bash
-kubectl delete -f 30-strategy-pd-single-node.yaml      # both RayJobs + the router
+kubectl delete -f 30-strategy-pd-single-node.yaml     # both RayJobs + the router
 kubectl -n v4-flash-demo delete raycluster v4-flash   # frees the head's 8 GPUs
 kubectl apply -f 40-strategy-replicas.yaml
-kubectl -n v4-flash-demo port-forward svc/v4-flash-replicas 8090:8000 &
-# failure demo (kills a replica that is actually being loaded, and measures it):
-kubectl -n v4-flash-demo delete pod -l app=v4-flash-replica --field-selector=... # pick one
+just probe-d          # each replica ALONE first — a fleet number hides a cold pod
+just bench-d          # then the aggregate through the Service
 ```
 
-Talking points: throughput multiplies with zero model traffic between machines;
-the Service reroutes around the killed replica while k8s restarts it.
+`just probe-d` is not optional if you intend to quote the number: measuring only through the
+Service is what produced three wrong diagnoses of this strategy.
 
 ## Cleanup
 
