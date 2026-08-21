@@ -23,7 +23,32 @@ set -uo pipefail
 export KUBECONFIG="${KUBECONFIG:-$(cd .. && pwd)/ray-demo-kubeconfig.yaml}"
 cd "$(dirname "$0")"
 
-say() { echo; echo "════════ $* — $(date -u +%H:%M:%SZ)"; }
+# Time each section. Each say() closes the previous section's clock, and times_report prints
+# the table at the end -- otherwise you scroll back through 90 minutes of log subtracting
+# timestamps by hand.
+_T_START=$(date +%s); _T_SEC=$_T_START; _T_LABEL=""; _T_ROWS=""
+say() {
+  local now; now=$(date +%s)
+  if [ -n "$_T_LABEL" ]; then
+    local d=$(( now - _T_SEC ))
+    _T_ROWS="${_T_ROWS}$(printf '  %-42s %3dm %02ds' "$_T_LABEL" $((d/60)) $((d%60)))
+"
+  fi
+  _T_LABEL="$*"; _T_SEC=$now
+  echo; echo "════════ $* — $(date -u +%H:%M:%SZ)"
+}
+times_report() {
+  local now; now=$(date +%s)
+  if [ -n "$_T_LABEL" ]; then
+    local d=$(( now - _T_SEC ))
+    _T_ROWS="${_T_ROWS}$(printf '  %-42s %3dm %02ds' "$_T_LABEL" $((d/60)) $((d%60)))
+"
+  fi
+  local tot=$(( now - _T_START ))
+  echo; echo "════════ SECTION TIMINGS"
+  printf '%s' "$_T_ROWS"
+  printf '  %-42s %3dm %02ds\n' "TOTAL" $((tot/60)) $((tot%60))
+}
 
 # A failed deploy-time bench is NOT cosmetic. bench.py's warmup plus the startupProbe do not
 # finish warming these engines -- strategy A is still climbing at its third loaded pass
@@ -85,4 +110,5 @@ just compare 2>&1
 say "REPEATABILITY"
 just stability 2>&1
 
+times_report
 say "DONE"
