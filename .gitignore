@@ -1,6 +1,8 @@
 *kubeconfig.yaml
 .DS_Store
 v4-flash-k8s-demo/metrics
-*.pptx
 # speaker prep carries the console deep link with org/project/cluster IDs
 *speaker-prep.md
+__pycache__
+serving-a-frontier-open-model-with-ray-and-vllm*.*
+
