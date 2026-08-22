@@ -12,7 +12,7 @@ Two passes, because that is the whole argument of the talk:
 TTFT/TPOT come from the SSE stream itself (first chunk vs. subsequent chunks), so
 they measure what a user feels, not what the server reports about itself.
 """
-import argparse, json, statistics, sys, threading, time, urllib.error, urllib.request
+import argparse, json, re, statistics, sys, threading, time, urllib.error, urllib.request
 from pathlib import Path
 
 PROMPT = (
@@ -120,7 +120,27 @@ def sanity(url, model):
         answer = (msg.get("content") or msg.get("reasoning_content") or "").strip()
     except Exception as exc:                       # noqa: BLE001 - report, never crash
         return False, f"<error: {exc!r}>"
-    return SANITY_A in answer, answer
+    return sane(answer), answer
+
+
+def sane(answer):
+    """Strict: the reply must BE the answer, not merely contain it.
+
+    `SANITY_A in answer` was a false-pass waiting to happen, and it happened: the P/D
+    router replied "o $ object:；QQ2vivoGz3.## 4660 (almosterCinvasive speciese" and passed,
+    because "4660" contains a 4. Fluent garbage is exactly what this gate exists to catch,
+    so a substring test is the wrong instrument -- it is the same mistake as counting tokens
+    without reading them, one level down.
+
+    Normalise away punctuation, spacing and case, then require the whole reply to be the
+    answer. A short tolerance is kept ("4.", "= 4") because the prompt says "reply with only
+    the number" and correct engines here answer exactly "4", but a stray period should not
+    fail a good engine. Sixty characters of word salad cannot survive it.
+    """
+    norm = re.sub(r"[^a-z0-9]", "", (answer or "").lower())
+    if norm in ("4", "four"):
+        return True
+    return len(norm) <= 6 and "4" in norm
 
 
 def pass_single(url, model, max_tokens, runs):

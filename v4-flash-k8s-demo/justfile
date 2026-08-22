@@ -10,6 +10,33 @@ export KUBECONFIG := env_var_or_default("KUBECONFIG", justfile_directory() + "/.
 ns := "v4-flash-demo"
 model := "deepseek-ai/DeepSeek-V4-Flash-0731"
 
+# Point BARE kubectl at this demo's kubeconfig.
+#
+#     eval "$(just enable-kube)"
+#
+# The recipes in this justfile already export KUBECONFIG themselves (see the top), so this
+# is only for typing `kubectl` directly. It PRINTS the export line rather than setting it,
+# because a recipe runs in a child process and a child cannot mutate its parent's
+# environment -- `just enable-kube` on its own would appear to work and change nothing.
+# Only the export line goes to stdout, so the eval stays clean; checks go to stderr.
+[doc("Print the export line so bare kubectl uses this cluster — eval \"$(just enable-kube)\"")]
+enable-kube:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    cfg="{{ justfile_directory() }}/../ray-demo-kubeconfig.yaml"
+    if [ ! -f "$cfg" ]; then
+      echo "kubeconfig not found: $cfg" >&2
+      exit 1
+    fi
+    abs="$(cd "$(dirname "$cfg")" && pwd)/$(basename "$cfg")"
+    if KUBECONFIG="$abs" kubectl get --raw /readyz >/dev/null 2>&1; then
+      ctx=$(KUBECONFIG="$abs" kubectl config current-context 2>/dev/null)
+      echo "# cluster answers /readyz · context ${ctx:-?} · namespace {{ ns }}" >&2
+    else
+      echo "# WARNING: cluster did not answer /readyz with this kubeconfig" >&2
+    fi
+    echo "export KUBECONFIG=$abs"
+
 default:
     @just --list --unsorted
 
@@ -238,20 +265,72 @@ verify-output:
     set -uo pipefail
     # The anti-lying tool. Throughput cannot report incorrectness; only reading an answer can.
     # This is what caught TP4 returning Java package declarations at 1,703.9 tok/s.
+    #
+    # PASS/FAIL alone is not actionable, because on demo day SOME ENDPOINTS ARE SUPPOSED TO
+    # FAIL. Strategy C is the broken shape on purpose -- it is demo beat 4. So this reports
+    # what it GOT against what the demo script EXPECTS, and the thing to act on is a
+    # MISMATCH, not a FAIL. The exit code is the mismatch count, so it can gate a script.
+    #
+    # Expectations come from 30-strategy-pd-single-node.yaml's own findings table:
+    #   prefill TP4 -> garbage · the router inherits it · decode DP4xEP is correct
+    # So 8200 passing while 8100 fails is not a puzzle, it is the diagnosis: it localises the
+    # fault to TP4 and rules out the KV handoff, since a broken handoff would corrupt decode.
+    expect_for() {
+      case "$1" in
+        pd-router:*)          echo "FAIL|C is the broken shape on purpose — demo beat 4" ;;
+        pd-pools:8100)        echo "FAIL|TP4 prefill is the fault on v0.27.1" ;;
+        pd-pools:8200)        echo "PASS|DP4xEP decode is the correct shape" ;;
+        v4-flash-longctx:*)   echo "PASS|the 1M engine, TP8" ;;
+        v4-flash-tep8:*)      echo "PASS|strategy A, Deployment with its own Ray" ;;
+        v4-flash-openai:*)    echo "PASS|strategy B, RayJob on the shared head" ;;
+        v4-flash-replicas:*)  echo "PASS|strategy D, whole replicas" ;;
+        *)                    echo "?|no expectation recorded for this endpoint" ;;
+      esac
+    }
     live=$(just _endpoints)
     [ -n "$live" ] || { echo "nothing is serving"; exit 1; }
-    fails=0
-    echo "$live" | while read -r svc port; do
-      printf "  %-22s " "$svc:$port"
+    mismatch=0; unknown=0; n=0
+    printf "  %-22s %-5s %-9s %s\n" "endpoint" "got" "expected" "verdict"
+    # Process substitution, NOT a pipe: a `while` on the right of a pipe runs in a subshell,
+    # so counters incremented inside it were discarded and this recipe always exited 0.
+    while read -r svc port; do
+      [ -n "${svc:-}" ] || continue
+      ep="$svc:$port"; n=$((n+1))
       out=$(just ask "What is 2+2? Reply with only the number." "$svc" "$port" 0.0 2>/dev/null \
             | grep -v "^→ POST\|^    model=\|^    prompt\[\|^--" | tr '\n' ' ')
-      case "$out" in
-        *4*) echo "PASS   $(echo "$out" | cut -c1-60)" ;;
-        *)   echo "FAIL   $(echo "$out" | cut -c1-60)"; fails=1 ;;
-      esac
-    done
+      # STRICT: the reply must BE "4", not merely contain a 4. `case *4*` passed the router's
+      # "o $ object:；QQ2vivoGz3.## 4660 (almosterCinvasive speciese" because of the 4660 --
+      # a false pass on the one endpoint whose failure the demo depends on. Normalise away
+      # punctuation and case, then require the whole reply to be the answer, with a short
+      # tolerance so "4." or "= 4" from a good engine still passes.
+      norm=$(printf '%s' "$out" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')
+      if [ "$norm" = "4" ] || [ "$norm" = "four" ] \
+         || { [ "${#norm}" -le 6 ] && case "$norm" in *4*) true ;; *) false ;; esac; }; then
+        got=PASS
+      else
+        got=FAIL
+      fi
+      exp="$(expect_for "$ep")"; want="${exp%%|*}"; why="${exp#*|}"
+      if [ "$want" = "?" ]; then
+        verdict="?  unknown endpoint — $why"; unknown=$((unknown+1))
+      elif [ "$got" = "$want" ]; then
+        verdict="✓  as scripted — $why"
+      else
+        verdict="⛔ UNEXPECTED — $why"; mismatch=$((mismatch+1))
+      fi
+      printf "  %-22s %-5s %-9s %s\n" "$ep" "$got" "$want" "$verdict"
+      printf "  %-22s %s\n" "" "answered: $(echo "$out" | cut -c1-58)"
+    done < <(echo "$live")
     echo
-    echo "  A FAIL means that engine's throughput number describes wrong answers. Do not quote it."
+    if [ "$mismatch" -eq 0 ] && [ "$unknown" -eq 0 ]; then
+      echo "  → PRE-FLIGHT OK: $n/$n endpoints match the demo script."
+    else
+      [ "$mismatch" -gt 0 ] && echo "  → PRE-FLIGHT MISMATCH: $mismatch of $n endpoints differ from the script."
+      [ "$unknown" -gt 0 ]  && echo "  → $unknown endpoint(s) have no recorded expectation — add one, or ignore."
+      echo "  Read the ⛔ lines before you walk on: an EXPECTED fail is fine, a mismatch means"
+      echo "  the demo no longer does what the script says it does."
+    fi
+    exit "$mismatch"
 
 # --- teardown ---------------------------------------------------------------
 # 24 GPUs across three machines. A, B and C each want 8 and D wants 16, so *some* pairs
