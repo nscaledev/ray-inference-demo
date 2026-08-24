@@ -100,7 +100,7 @@ def ask(url, model, prompt, max_tokens=48, timeout=1800):
     req = urllib.request.Request(url, data=body,
                                 headers={"content-type": "application/json"})
     start = time.perf_counter()
-    ttft, text, prompt_tokens = None, [], None
+    ttft, text, prompt_tokens, completion_tokens = None, [], None, None
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         for raw in resp:
             if not raw.startswith(b"data: "):
@@ -114,6 +114,7 @@ def ask(url, model, prompt, max_tokens=48, timeout=1800):
                 continue
             if obj.get("usage"):
                 prompt_tokens = obj["usage"].get("prompt_tokens") or prompt_tokens
+                completion_tokens = obj["usage"].get("completion_tokens") or completion_tokens
             choices = obj.get("choices") or []
             delta = choices[0].get("delta", {}) if choices else {}
             piece = delta.get("content") or delta.get("reasoning_content")
@@ -122,7 +123,7 @@ def ask(url, model, prompt, max_tokens=48, timeout=1800):
             if ttft is None:
                 ttft = time.perf_counter() - start
             text.append(piece)
-    return ttft, time.perf_counter() - start, "".join(text), prompt_tokens
+    return ttft, time.perf_counter() - start, "".join(text), prompt_tokens, completion_tokens
 
 
 def main():
@@ -143,7 +144,7 @@ def main():
     print(f"  target ~{args.tokens:,} tok · {len(prompt):,} chars · needle at depth "
           f"{args.depth:.2f}", flush=True)
     try:
-        ttft, total, answer, ptok = ask(url, args.model, prompt)
+        ttft, total, answer, ptok, ctok = ask(url, args.model, prompt)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf8", "ignore")[:300]
         print(f"  REJECTED  HTTP {exc.code}: {detail}")
@@ -166,6 +167,19 @@ def main():
     ratio = f" · {len(prompt)/ptok:.2f} chars/tok" if ptok else ""
     print(f"  prompt_tokens {got} · TTFT {ttft:.1f}s · total {total:.1f}s · "
           f"needle {'FOUND' if found else 'MISSED'}{ratio}")
+    # Second line in the SAME shape the ask recipes print, so the demo speaks one vocabulary
+    # whichever command produced the number. TTFT is real here -- this request streams, so the
+    # first content frame is genuinely the first token, unlike the buffered ask recipes which
+    # can only honestly report end-to-end latency.
+    bits = [f"latency {total:.1f}s", f"TTFT {ttft:.1f}s"]
+    if ctok and total > ttft and ctok > 1:
+        bits.append(f"TPOT {(total - ttft) / (ctok - 1) * 1000:.0f}ms")
+    # NO aggregate tok/s here. 11 tokens over 62.9s reads as "0.2 tok/s", which sounds like a
+    # broken engine -- almost all of that wall time is prefill of a 996K-token prompt, and decode
+    # actually ran at ~7ms per token. TPOT above is the honest figure; an aggregate rate over a
+    # prefill-dominated request is a true number that misinforms.
+    bits.append(f"{got} prompt + {ctok if ctok is not None else 0} completion tokens")
+    print("  -- " + " · ".join(bits))
     if not found:
         print(f"    answered: {answer.strip()[:160]!r}")
     # A MISSED needle is a RESULT, not a harness failure. With backoffLimit: 0 a non-zero exit
