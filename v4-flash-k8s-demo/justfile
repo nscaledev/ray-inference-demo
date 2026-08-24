@@ -48,12 +48,19 @@ state:
     @echo "=== nodes / GPUs ==="
     @kubectl get nodes -o custom-columns='NAME:.metadata.name,TYPE:.metadata.labels.node\.kubernetes\.io/instance-type,GPU:.status.allocatable.nvidia\.com/gpu'
     @echo
+    # Running/Pending ONLY. Filtering on the GPU request alone listed a Completed pod
+    # from a two-day-old dcgmi stress Job as still holding 8 GPUs: a finished pod's
+    # containers have exited and released their devices. This block is on screen during
+    # demo beat 1, where the whole point is saying truthfully what is holding what.
     @echo "=== GPU allocation (who holds them) ==="
     @kubectl get pods -A -o json | python3 -c 'import json,sys; \
       pods=json.load(sys.stdin)["items"]; \
+      live=lambda p: p["status"].get("phase") in ("Running","Pending"); \
       rows=[(p["metadata"]["namespace"], p["metadata"]["name"], c["resources"].get("requests",{}).get("nvidia.com/gpu"), p["spec"].get("nodeName") or "-") \
-            for p in pods for c in p["spec"]["containers"] if c["resources"].get("requests",{}).get("nvidia.com/gpu")]; \
-      print("\n".join(f"  {g}x GPU  {ns}/{n}  on {node}" for ns,n,g,node in rows) or "  none")'
+            for p in pods if live(p) for c in p["spec"]["containers"] if c["resources"].get("requests",{}).get("nvidia.com/gpu")]; \
+      total=sum(int(g) for _,_,g,_ in rows); \
+      print("\n".join(f"  {g}x GPU  {ns}/{n}  on {node}" for ns,n,g,node in rows) or "  none"); \
+      print(f"  ---- {total} GPU(s) held")'
     @echo
     @echo "=== RayCluster ==="
     @kubectl -n {{ns}} get raycluster 2>/dev/null || echo "  none"
@@ -83,13 +90,19 @@ _endpoints:
     #!/usr/bin/env bash
     set -uo pipefail
     probe=""
-    for sel in "ray.io/node-type=head" "app=v4-flash-longctx" "app=v4-flash-replica"; do
+    for sel in "ray.io/node-type=head" "app=v4-flash-longctx" "app=v4-flash-tep8" "app=v4-flash-replica"; do
       probe=$(kubectl -n {{ns}} get pods -l "$sel" --field-selector=status.phase=Running \
               -o name 2>/dev/null | head -1 | cut -d/ -f2)
       [ -n "$probe" ] && break
     done
     [ -z "$probe" ] && exit 0
-    for target in v4-flash-openai:8000 pd-router:8000 pd-pools:8100 pd-pools:8200 \
+    # EVERY service any strategy can expose. This list is the blast radius of the whole
+    # sanity gate: an endpoint missing here is never asked a question, so verify-output
+    # reports a clean pre-flight for engines it never looked at. That happened --
+    # v4-flash-tep8 (strategy A, the deck's headline shape) was absent from the moment 10b
+    # introduced it, and a from-scratch run reported "2/2 endpoints behaved as expected"
+    # with A serving, unchecked, and exit 0.
+    for target in v4-flash-tep8:8000 v4-flash-openai:8000 pd-router:8000 pd-pools:8100 \
                   v4-flash-replicas:8000 v4-flash-longctx:8000; do
       svc=${target%%:*}; port=${target##*:}
       if kubectl -n {{ns}} exec "$probe" -- curl -sf -m 4 \
@@ -182,9 +195,14 @@ watch-gpus interval="2":
     set -uo pipefail
     while true; do clear; date +%T; just gpus; sleep {{interval}}; done
 
-# Ask the live endpoint one question (whichever strategy is serving).
-[doc("Ask whichever endpoint is serving one question, and print the answer")]
-ask prompt="One sentence: why keep expert routing on NVLink?" svc="" port="8000" temp="1.0":
+# The raw primitive: ask ANY service. Private on purpose. As a public `just ask` with an empty
+# svc it picked the first live endpoint, which during strategy C is the P/D router -- so the
+# most convenient command was also the one that returned garbage. Every public ask-* recipe
+# names its strategy and refuses unless that strategy is serving.
+# (No [doc] attribute: a leading underscore hides it from `just --list` anyway, and an
+# attribute must sit IMMEDIATELY above its recipe -- a comment in between orphans it and just
+# fails with "Extraneous attribute".)
+_ask prompt="One sentence: why keep expert routing on NVLink?" svc="" port="8000" temp="1.0":
     #!/usr/bin/env bash
     set -uo pipefail
     # svc="" means "whatever is serving". The old default was a hardcoded Service that is
@@ -203,7 +221,13 @@ ask prompt="One sentence: why keep expert routing on NVLink?" svc="" port="8000"
     # temp defaults to the model card's 1.0 for the live beat; pass 0.0 to use this as a
     # diagnostic (greedy decoding on a model specified for 1.0 tends to read repetitive).
     body=$(python3 make_request.py "{{model}}" "{{prompt}}" 200 "http://$svc:$port/v1/chat/completions" "{{temp}}")
-    kubectl -n {{ns}} exec "$probe" -- curl -s -m 300 "http://$svc:$port/v1/chat/completions" -H 'content-type: application/json' -d "$body" > /tmp/just-ask.json 2>/dev/null
+    # -w appends curl's own %{time_total} as a trailing __TIMING__ line, measured INSIDE the
+    # pod so it excludes kubectl-exec setup. show_answer.py strips it before parsing the JSON
+    # and prints latency + tok/s + token counts on one line. NOT called TTFT: this request is
+    # buffered, so first-byte time IS last-token time, and that label would lie.
+    kubectl -n {{ns}} exec "$probe" -- curl -s -m 300 "http://$svc:$port/v1/chat/completions" \
+      -H 'content-type: application/json' -d "$body" \
+      -w '\n__TIMING__ %{time_total}\n' > /tmp/just-ask.json 2>/dev/null
     python3 show_answer.py /tmp/just-ask.json
 
 # Driver log of the running RayJob (strategies A, B and C).
@@ -221,7 +245,7 @@ logs:
 # would be a new way to mislead, so each of these refuses unless the strategy it names is the
 # one actually serving. `just ask` already echoes the request and prints the reply; these add
 # the label and the guard.
-_ask-strategy label want svc port prompt temp="1.0":
+_ask-strategy label want svc port prompt temp="1.0" note="":
     #!/usr/bin/env bash
     set -uo pipefail
     case "{{want}}" in
@@ -233,102 +257,137 @@ _ask-strategy label want svc port prompt temp="1.0":
         [ "$st" = "RUNNING" ] || { echo "REFUSING: {{label}} is not serving — rayjob {{want}} is '${st:-absent}'"; exit 1; } ;;
     esac
     echo "──── {{label}} ────"
-    just ask "{{prompt}}" "{{svc}}" "{{port}}" "{{temp}}"
+    # NEVER put a backtick in a note. just interpolates {{note}} into a double-quoted bash
+    # string, so a backtick survives as command substitution: a note reading "... is
+    # \`just longctx\`" actually RAN just longctx, firing a 996K-token request as a side
+    # effect of asking a 19-token question. Write command names bare instead.
+    # The note prints BEFORE the request, not after: `just ask` hits the million-token engine
+    # with a 74-character prompt, and the room will assume it just watched the million-token
+    # test unless told otherwise -- and by the time the answer lands, the moment to say it has
+    # passed. Anything that explains what is about to happen has to be on screen first.
+    [ -n "{{note}}" ] && echo "     {{note}}"
+    [ -n "{{note}}" ] && echo
+    just _ask "{{prompt}}" "{{svc}}" "{{port}}" "{{temp}}"
 
 [doc("Ask strategy A and show the exchange (refuses unless A is serving)")]
 ask-a prompt="In one sentence: why keep expert routing inside the NVLink domain?" temp="1.0":
-    @just _ask-strategy "A · TEP8 (TP8 + EP, Deployment)" deploy/v4-flash-tep8 v4-flash-tep8 8000 "{{prompt}}" "{{temp}}"
+    @just _ask-strategy "A · TEP8 (TP8 + EP, Deployment)" deploy/v4-flash-tep8 v4-flash-tep8 8000 "{{prompt}}" "{{temp}}" "strategy A — attention sliced 8 ways, whole experts per GPU. The latency shape."
 
 [doc("Ask strategy B and show the exchange (refuses unless B is serving)")]
 ask-b prompt="In one sentence: what does speculative decoding change about decode?" temp="1.0":
-    @just _ask-strategy "B · DP8xEP + MegaMoE + DSpark" serve-dp8-ep v4-flash-openai 8000 "{{prompt}}" "{{temp}}"
+    @just _ask-strategy "B · DP8xEP + MegaMoE + DSpark" serve-dp8-ep v4-flash-openai 8000 "{{prompt}}" "{{temp}}" "strategy B — the shape DeepSeek published: data parallel by 8, expert parallel, speculator on."
 
 [doc("Ask B-without-DSpark and show the exchange")]
 ask-b-nospec prompt="In one sentence: what is expert parallelism?" temp="1.0":
-    @just _ask-strategy "B - DSpark (DP8xEP + MegaMoE)" serve-dp8-ep-nospec v4-flash-openai 8000 "{{prompt}}" "{{temp}}"
+    @just _ask-strategy "B - DSpark (DP8xEP + MegaMoE)" serve-dp8-ep-nospec v4-flash-openai 8000 "{{prompt}}" "{{temp}}" "strategy B with the speculator removed — the DSpark isolation run."
 
 [doc("Ask strategy C through the P/D router (expected to FAIL the sanity check — see 30-)")]
 ask-c prompt="What is 2+2? Reply with only the number." temp="0.0":
-    @just _ask-strategy "C · P/D 4+4 via vllm-router" serve-pd-decode pd-router 8000 "{{prompt}}" "{{temp}}"
+    @just _ask-strategy "C · P/D 4+4 via vllm-router" serve-pd-decode pd-router 8000 "{{prompt}}" "{{temp}}" "strategy C — EXPECTED TO ANSWER WRONGLY. TP4 prefill is broken on this build."
 
 [doc("Ask strategy D through the replica Service")]
 ask-d prompt="In one sentence: what does scaling out with whole replicas buy you?" temp="1.0":
-    @just _ask-strategy "D · replicas" deploy/v4-flash-replicas v4-flash-replicas 8000 "{{prompt}}" "{{temp}}"
+    @just _ask-strategy "D · replicas" deploy/v4-flash-replicas v4-flash-replicas 8000 "{{prompt}}" "{{temp}}" "strategy D — two whole replicas of A behind one Service."
 
 [doc("Ask the 1M-window engine and show the exchange")]
-ask-1m prompt="In one sentence: why does a longer context cost cache rather than compute?" temp="1.0":
-    @just _ask-strategy "1M window (TP8 + EP, max-model-len 1048576)" deploy/v4-flash-longctx v4-flash-longctx 8000 "{{prompt}}" "{{temp}}"
+ask prompt="In one sentence: why does a longer context cost cache rather than compute?" temp="1.0":
+    @just _ask-strategy "1M window (TP8 + EP, max-model-len 1048576)" deploy/v4-flash-longctx v4-flash-longctx 8000 "{{prompt}}" "{{temp}}" "holds 1,048,576 tokens of context. This is a SHORT prompt, not a million-token one — that test is: just longctx"
 
 [doc("Ask EVERY live endpoint questions with known answers — PASS/FAIL per endpoint")]
 verify-output:
     #!/usr/bin/env bash
     set -uo pipefail
-    # The anti-lying tool. Throughput cannot report incorrectness; only reading an answer can.
-    # This is what caught TP4 returning Java package declarations at 1,703.9 tok/s.
+    # The anti-lying tool, and it is shown ON STAGE, so it reads for an audience first and an
+    # operator second. That means: name the SHAPE of each engine, print the answer it actually
+    # gave, and say plainly which are wrong. No internal vocabulary -- an earlier version
+    # printed "as scripted — demo beat 4", which means nothing to a room.
     #
-    # PASS/FAIL alone is not actionable, because on demo day SOME ENDPOINTS ARE SUPPOSED TO
-    # FAIL. Strategy C is the broken shape on purpose -- it is demo beat 4. So this reports
-    # what it GOT against what the demo script EXPECTS, and the thing to act on is a
-    # MISMATCH, not a FAIL. The exit code is the mismatch count, so it can gate a script.
+    # The operator's pre-flight question ("is the demo still going to work?") is answered by
+    # the single line at the bottom and by the exit code, which is the mismatch count. A FAIL
+    # that is supposed to happen is not an alarm; a MISMATCH is.
     #
     # Expectations come from 30-strategy-pd-single-node.yaml's own findings table:
     #   prefill TP4 -> garbage · the router inherits it · decode DP4xEP is correct
-    # So 8200 passing while 8100 fails is not a puzzle, it is the diagnosis: it localises the
-    # fault to TP4 and rules out the KV handoff, since a broken handoff would corrupt decode.
-    expect_for() {
+    # strategy|parallelism|part|expected
+    #   strategy    the letter from the deck: A, B, C, D (or 1M for the long-context engine)
+    #   parallelism the ONLY thing that differs between these engines -- same weights, same
+    #               machine, same image
+    #   part        which piece of that strategy this endpoint is. P/D splits one request
+    #               across two engines, so C has three endpoints and A, B, D have one each.
+    shape_of() {
       case "$1" in
-        pd-router:*)          echo "FAIL|C is the broken shape on purpose — demo beat 4" ;;
-        pd-pools:8100)        echo "FAIL|TP4 prefill is the fault on v0.27.1" ;;
-        pd-pools:8200)        echo "PASS|DP4xEP decode is the correct shape" ;;
-        v4-flash-longctx:*)   echo "PASS|the 1M engine, TP8" ;;
-        v4-flash-tep8:*)      echo "PASS|strategy A, Deployment with its own Ray" ;;
-        v4-flash-openai:*)    echo "PASS|strategy B, RayJob on the shared head" ;;
-        v4-flash-replicas:*)  echo "PASS|strategy D, whole replicas" ;;
-        *)                    echo "?|no expectation recorded for this endpoint" ;;
+        pd-router:*)          echo "C|TP4 then DP4xEP|router (both)|WRONG" ;;
+        pd-pools:8100)        echo "C|TP4|prefill pool|WRONG" ;;
+        pd-pools:8200)        echo "C|DP4 x EP|decode pool|RIGHT" ;;
+        v4-flash-longctx:*)   echo "1M|TP8 + EP|whole engine|RIGHT" ;;
+        v4-flash-tep8:*)      echo "A|TP8 + EP|whole engine|RIGHT" ;;
+        v4-flash-openai:*)    echo "B|DP8 x EP + DSpark|whole engine|RIGHT" ;;
+        v4-flash-replicas:*)  echo "D|TP8 + EP, x2|both replicas|RIGHT" ;;
+        *)                    echo "?|?|unrecognised|?" ;;
       esac
     }
     live=$(just _endpoints)
     [ -n "$live" ] || { echo "nothing is serving"; exit 1; }
-    mismatch=0; unknown=0; n=0
-    printf "  %-22s %-5s %-9s %s\n" "endpoint" "got" "expected" "verdict"
-    # Process substitution, NOT a pipe: a `while` on the right of a pipe runs in a subshell,
-    # so counters incremented inside it were discarded and this recipe always exited 0.
+    echo
+    echo "  Asked every live endpoint the same question, with one known right answer:"
+    echo "      \"What is 2+2? Reply with only the number.\"   (temperature 0)"
+    echo
+    printf "  %-22s %-8s %-19s %-14s %s\n" "endpoint" "strategy" "parallelism" "part" "verdict"
+    printf "  %-22s %-8s %-19s %-14s %s\n" "----------------------" "--------" \
+           "-------------------" "--------------" "-------"
+    mismatch=0; unknown=0; n=0; wrong=0; pd=0
     while read -r svc port; do
       [ -n "${svc:-}" ] || continue
       ep="$svc:$port"; n=$((n+1))
-      out=$(just ask "What is 2+2? Reply with only the number." "$svc" "$port" 0.0 2>/dev/null \
+      out=$(just _ask "What is 2+2? Reply with only the number." "$svc" "$port" 0.0 2>/dev/null \
             | grep -v "^→ POST\|^    model=\|^    prompt\[\|^--" | tr '\n' ' ')
-      # STRICT: the reply must BE "4", not merely contain a 4. `case *4*` passed the router's
-      # "o $ object:；QQ2vivoGz3.## 4660 (almosterCinvasive speciese" because of the 4660 --
-      # a false pass on the one endpoint whose failure the demo depends on. Normalise away
-      # punctuation and case, then require the whole reply to be the answer, with a short
-      # tolerance so "4." or "= 4" from a good engine still passes.
+      # STRICT: the reply must BE "4", not merely contain a 4. `*4*` passed the router's
+      # "…## 4660 (almosterCinvasive speciese" -- a false pass on the endpoint whose
+      # wrongness the demo depends on.
       norm=$(printf '%s' "$out" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')
       if [ "$norm" = "4" ] || [ "$norm" = "four" ] \
          || { [ "${#norm}" -le 6 ] && case "$norm" in *4*) true ;; *) false ;; esac; }; then
-        got=PASS
+        got=RIGHT; mark="✓ correct"
       else
-        got=FAIL
+        got=WRONG; mark="✗ WRONG"; wrong=$((wrong+1))
       fi
-      exp="$(expect_for "$ep")"; want="${exp%%|*}"; why="${exp#*|}"
-      if [ "$want" = "?" ]; then
-        verdict="?  unknown endpoint — $why"; unknown=$((unknown+1))
-      elif [ "$got" = "$want" ]; then
-        verdict="✓  as scripted — $why"
-      else
-        verdict="⛔ UNEXPECTED — $why"; mismatch=$((mismatch+1))
-      fi
-      printf "  %-22s %-5s %-9s %s\n" "$ep" "$got" "$want" "$verdict"
-      printf "  %-22s %s\n" "" "answered: $(echo "$out" | cut -c1-58)"
+      case "$ep" in pd-*) pd=$((pd+1)) ;; esac
+      info="$(shape_of "$ep")"
+      strat="${info%%|*}"; r1="${info#*|}"; par="${r1%%|*}"
+      r2="${r1#*|}"; part="${r2%%|*}"; want="${r2#*|}"
+      [ "$want" = "?" ] && unknown=$((unknown+1))
+      [ "$want" != "?" ] && [ "$got" != "$want" ] && mismatch=$((mismatch+1))
+      # The answer gets its own line: it is multi-byte garbage, so printf (which pads by BYTES,
+      # not display columns) cannot align anything after it -- and it deserves the width,
+      # because the audience is meant to SEE it.
+      printf "  %-22s %-8s %-19s %-14s %s\n" "$ep" "$strat" "$par" "$part" "$mark"
+      printf "  %-22s   answered: %s\n" "" "$(echo "$out" | cut -c1-70)"
     done < <(echo "$live")
     echo
-    if [ "$mismatch" -eq 0 ] && [ "$unknown" -eq 0 ]; then
-      echo "  → PRE-FLIGHT OK: $n/$n endpoints match the demo script."
+    # The commentary adapts to what is actually on the table. Printing the P/D and TP4
+    # explanation unconditionally meant a pre-flight of A, B and the 1M engine ended with a
+    # lecture about a strategy that was not running -- over-weighting a config nobody should
+    # deploy, in the one output read at T-40 when attention is scarce.
+    echo
+    if [ "$wrong" -gt 0 ]; then
+      if [ "$pd" -gt 0 ]; then
+        echo "  P/D splits a request in two: the prefill pool reads the prompt and hands its KV"
+        echo "  cache to the decode pool, which writes the answer. The router fronts both, so it"
+        echo "  inherits whatever prefill produced."
+      fi
+      echo "  Same weights, same machine, same image -- only the parallelism differs. Every one"
+      echo "  of those returned HTTP 200 with zero failed requests. A throughput number cannot"
+      echo "  see this. Only reading the answer can."
     else
-      [ "$mismatch" -gt 0 ] && echo "  → PRE-FLIGHT MISMATCH: $mismatch of $n endpoints differ from the script."
-      [ "$unknown" -gt 0 ]  && echo "  → $unknown endpoint(s) have no recorded expectation — add one, or ignore."
-      echo "  Read the ⛔ lines before you walk on: an EXPECTED fail is fine, a mismatch means"
-      echo "  the demo no longer does what the script says it does."
+      echo "  All correct, so every number these engines produce is quotable. Throughput alone"
+      echo "  could never have told you that -- only reading an answer can."
+    fi
+    echo
+    if [ "$mismatch" -eq 0 ] && [ "$unknown" -eq 0 ]; then
+      echo "  pre-flight: $n/$n endpoints behaved as the runbook expects."
+    else
+      [ "$mismatch" -gt 0 ] && echo "  pre-flight: ⛔ $mismatch of $n endpoints did NOT behave as expected — read the table."
+      [ "$unknown" -gt 0 ]  && echo "  pre-flight: $unknown endpoint(s) unrecognised — add them to shape_of()."
     fi
     exit "$mismatch"
 
@@ -339,8 +398,35 @@ verify-output:
 # deliberately runs C and D together for the demo. Call these directly to free hardware.
 
 # Remove whatever strategy is serving. Keeps the RayCluster, the PVC and the weights.
+# REFUSES if a long-running orchestrator is mid-flight. teardown and demo-e2e.sh both drive
+# the same namespace, and running them together produces a state neither intends: prep applies
+# the three engines, a manual teardown kills their pods, the surviving Deployments recreate
+# replacements, and those sit Pending on GPUs the terminating pods have not released yet. It
+# looks like a cluster fault and is just two scripts disagreeing. Same guard as _bench_start.
+# Override with FORCE=1 when you know the other process is dead.
 [doc("Remove whatever strategy is serving; keep the RayCluster, PVC and weights")]
 teardown:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    if [ "${FORCE:-0}" != "1" ]; then
+      # Match the INVOCATION, not any command line that mentions the name. `pgrep -fl` on a
+      # bare name also matched the shell that was running this very check -- its command line
+      # contains the string -- and printed sixty lines of exported environment as "evidence".
+      # Anchor on `bash <path>/<script>` and print pid + script only.
+      pids=$(pgrep -f '(bash|sh|zsh)? *[^ ]*(demo-e2e|pre-demo)\.sh' 2>/dev/null | grep -vx "$$" || true)
+      if [ -n "$pids" ]; then
+        echo "REFUSING to tear down: an orchestrator is mid-run and will fight this."
+        for pid in $pids; do
+          nm=$(ps -o command= -p "$pid" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i ~ /\.sh$/) {print $i; exit}}')
+          echo "    pid $pid  ${nm:-unknown}"
+        done
+        echo "  Let it finish, or:  kill $(echo $pids | tr '\n' ' ') && FORCE=1 just teardown"
+        exit 1
+      fi
+    fi
+    just _teardown-now
+
+_teardown-now:
     -@kubectl -n {{ns}} delete rayjob --all --ignore-not-found 2>/dev/null
     -@kubectl delete -f 30-strategy-pd-single-node.yaml --ignore-not-found 2>/dev/null
     -@kubectl delete -f 30b-pd-proxy-fallback.yaml --ignore-not-found 2>/dev/null
