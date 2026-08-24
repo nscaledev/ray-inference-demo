@@ -1004,6 +1004,22 @@ repeat-tour rounds="2":
     done
 
 # Median / min / max / spread across every repeat — flags anything above 1.5x.
+# Demo beat 4's evidence. Strategy C is NOT running during the demo -- this prints the
+# artifact the harness wrote when C WAS measured, which is the whole point: the file records a
+# throughput number next to a verdict that the number is worthless.
+# A recipe rather than a `grep metrics/C-pd.json` in the runbook, because every other demo
+# command is `just something`, and the single bare relative path is exactly the one that breaks
+# when you are standing one directory up.
+# No heredoc: a `<<'PY'` terminator has to sit at column 0, which collides with just's rule
+# that every recipe line is indented. One python -c, one print.
+[doc("Beat 4: print the recorded proof that C was fast and wrong")]
+receipt:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    f="{{ justfile_directory() }}/metrics/C-pd.json"
+    [ -f "$f" ] || { echo "no C measurement on disk at $f"; exit 1; }
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); u=d["under_load"]; print("\n  " + d.get("label","C · P/D 4+4") + "  (recorded — C is NOT running)\n  " + "-"*68 + "\n  aggregate throughput   " + str(u["aggregate_output_tok_s"]) + " tok/s\n  failed requests        " + str(u.get("failed",0)) + "\n  concurrency            " + str(u.get("concurrency")) + "\n  output_sane            " + str(d["output_sane"]) + "   <-- the gate\x27s verdict\n  it was asked           \"What is 2+2? Reply with only the number.\"\n  it answered            " + repr(d["sanity_answer"][:110]) + "\n\n  Fast, zero errors, HTTP 200 every time, and wrong. Throughput cannot report\n  incorrectness — so `just compare` prints this column as ✗, not as numbers.\n")' "$f"
+
 [doc("Derive every deck/abstract claim from the measurements, with provenance")]
 claims:
     @python3 claims.py
