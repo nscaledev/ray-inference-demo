@@ -153,10 +153,10 @@ def main():
         print(f"  UNREACHABLE  {exc.reason} — endpoint down, or the tunnel dropped under a "
               f"{len(prompt)/1e6:.1f} MB body. Prefer the in-cluster Job.")
         return 4
-    # ttft is None when the stream carried no content at all. That happened for real: a 1M
-    # prompt is a ~5.8 MB body, `kubectl port-forward` died mid-request, and this line raised
-    # TypeError on None instead of saying so — then every later depth failed with "connection
-    # refused". A measurement harness must report its own failure, not crash on it.
+    # ttft is None when the stream carried no content at all — which is a real outcome here, not
+    # a hypothetical: a 1M prompt is a ~5.8 MB body and `kubectl port-forward` does not reliably
+    # survive it. A measurement harness has to report its own failure rather than raise a
+    # TypeError on None, because a crash here reads as a broken engine.
     if ttft is None:
         print(f"  NO CONTENT returned after {total:.1f}s — the stream closed without a token. "
               f"Check the engine is up and that this is not going through a tunnel "

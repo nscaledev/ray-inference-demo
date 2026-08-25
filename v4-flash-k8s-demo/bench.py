@@ -126,11 +126,11 @@ def sanity(url, model):
 def sane(answer):
     """Strict: the reply must BE the answer, not merely contain it.
 
-    `SANITY_A in answer` was a false-pass waiting to happen, and it happened: the P/D
-    router replied "o $ object:；QQ2vivoGz3.## 4660 (almosterCinvasive speciese" and passed,
-    because "4660" contains a 4. Fluent garbage is exactly what this gate exists to catch,
-    so a substring test is the wrong instrument -- it is the same mistake as counting tokens
-    without reading them, one level down.
+    A substring test is the wrong instrument here. Fluent garbage is exactly what this gate
+    exists to catch, and a reply like "o $ object:；QQ2vivoGz3.## 4660 (almosterCinvasive
+    speciese" contains a 4 -- so `SANITY_A in answer` passes it. Checking that a number appears
+    somewhere in the output is the same error as counting tokens without reading them, one
+    level down.
 
     Normalise away punctuation, spacing and case, then require the whole reply to be the
     answer. A short tolerance is kept ("4.", "= 4") because the prompt says "reply with only
@@ -162,20 +162,17 @@ def pass_single(url, model, max_tokens, runs):
 def warmup(urls, model, concurrency, max_tokens=64):
     """Fire requests of the MEASURED shape at every endpoint and discard the results.
 
-    Readiness is not warmth. /health returns OK as soon as the API server is up, but the
-    first request of a given shape can trigger lazy kernel autotune inside the engine —
-    tens of seconds. The single-stream pass only ever touches urls[0], so with two
-    replicas behind a Service the second one used to meet the measured load stone cold:
-    half the requests queued behind compilation, TTFT p95 came out ~36 s, and aggregate
-    halved. That reproduced identically through a port-forward and in-cluster, which is
-    how we know the tunnel was never the cause.
+    Readiness is not warmth. /health returns OK as soon as the API server is up, but the first
+    request of a given shape can trigger lazy kernel autotune inside the engine — tens of
+    seconds. The single-stream pass only ever touches urls[0], so behind a multi-replica Service
+    every OTHER replica must be warmed explicitly or it meets the measured load cold: requests
+    queue behind compilation, TTFT p95 blows out, and the aggregate halves.
 
-    The shape has to MATCH, which took two wrong fixes to learn. Warming every endpoint was
-    not enough while this function capped warmup at 64 tokens and the measurement used 256:
-    the decode length keys the cost too, so the 256-token path stayed cold and strategy D
-    kept coming out bimodal (218 - 4417 tok/s, 20x spread) with warmup nominally in place.
-    Measured directly, per replica, the effect is a one-time cost that follows whichever pod
-    has not recently served the measured shape — it is NOT a permanently sick pod:
+    The warm-up shape has to MATCH the measured shape in BOTH dimensions. Concurrency keys
+    CUDA-graph capture and MoE autotune, and decode length keys it too — so warming at 64 tokens
+    before measuring at 256 leaves the 256-token path cold and the result comes out bimodal even
+    with warm-up nominally in place. Measured per replica, the effect is a one-time cost that
+    follows whichever pod has not recently served the measured shape, not a permanently sick pod:
         first pass on a pod    ~400 tok/s, TTFT p95 18-40 s
         every pass after that  ~2050-2490 tok/s, six consecutive passes, 1.22x spread
     and it recurs after the pod sits idle, which is why this runs before every measurement

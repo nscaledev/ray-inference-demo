@@ -1,0 +1,174 @@
+# 21b — STRATEGY B WITH THE SPECULATOR REMOVED. Identical to 21 minus speculative_config.
+#
+#     kubectl apply -f 21-strategy-dp8-ep-rayservice.yaml
+#     kubectl -n v4-flash-demo wait --for=condition=Ready rayservice/v4-flash-b --timeout=40m
+#     just ask-b
+#
+# This exists to isolate DSpark's contribution: the only difference from 21 is that
+# speculative_config is absent. Measured at 1378.3 tok/s against B's 1694.6, so the
+# speculator is worth 1.23x on this hardware.
+#
+# It reuses B's endpoint name, so only one of 21 and 21b can be live at a time. That is
+# deliberate: an A/B on the same address removes the endpoint as a variable.
+#
+# A DIFFERENT BUILDER. build_openai_app takes a LIST (llm_configs); build_dp_openai_app takes a
+# SINGLE llm_config, because a DP group is one logical engine spread across eight ranks rather
+# than eight independent engines. Each rank becomes a Serve replica, gang-scheduled, with rank 0
+# publishing the address the others connect to.
+#
+# THE COUNTING RULE. In a DP deployment num_replicas means DP GROUPS, and Ray multiplies it by
+# data_parallel_size to get the number of Serve replicas (dp_server.py:279):
+#
+#     data_parallel_size: 8  +  num_replicas: 1   ->  8 Serve replicas, 8 GPUs   correct
+#     data_parallel_size: 8  +  num_replicas: 8   ->  64 Serve replicas          asks for 64 GPUs
+#
+# This is the same shape of error as requesting GPUs on a replica actor that already has a
+# placement group (see 11): both ask for more hardware than exists, and both present as a
+# placement group that never schedules while the application status reads DEPLOYING. `ray status`
+# under "Pending Demands" is the fastest way to tell the two apart from slow progress.
+#
+# ON VLLM_USE_BREAKABLE_CUDAGRAPH, which 11 requires: B does not need it. TP1 per rank means
+# vLLM uses UniProcExecutor, so the worker IS the engine-core process and reads the value that
+# process set for itself -- there are no separate actors to lose it to. It is pinned below
+# anyway, so that the value is visible in the manifest rather than merely harmless.
+apiVersion: ray.io/v1
+kind: RayService
+metadata:
+  name: v4-flash-b-nospec
+  namespace: v4-flash-demo
+spec:
+  serviceUnhealthySecondThreshold: 1200
+  deploymentUnhealthySecondThreshold: 1200
+  serveConfigV2: |
+    applications:
+      - name: llm
+        route_prefix: /
+        import_path: ray.serve.llm:build_dp_openai_app
+        args:
+          # SINGULAR. build_dp_openai_app validates against DPOpenAiServingArgs, whose field is
+          # llm_config, not llm_configs.
+          llm_config:
+            model_loading_config:
+              model_id: deepseek-ai/DeepSeek-V4-Flash-0731
+              model_source: /models/DeepSeek-V4-Flash-0731
+            # Copied from 20's command line, which is the measured-correct B config.
+            engine_kwargs:
+              data_parallel_size: 8
+              enable_expert_parallel: true
+              # The MoE kernel that makes B fast. Without it B is not the reference config.
+              moe_backend: deep_gemm_mega_moe
+              trust_remote_code: true
+              kv_cache_dtype: fp8
+              block_size: 256
+              attention_config:
+                use_fp4_indexer_cache: true
+              tokenizer_mode: deepseek_v4
+              tool_call_parser: deepseek_v4
+              enable_auto_tool_choice: true
+              reasoning_parser: deepseek_v4
+              max_model_len: 262144
+              # NOT SET: data_parallel_backend. 20 passed --data-parallel-backend ray because it
+              # was launching its own DP ranks. Here DPServer assigns data_parallel_rank,
+              # data_parallel_address and data_parallel_rpc_port to each replica itself
+              # (dp_server.py:165), so letting vLLM also try to place ranks is a second
+              # orchestrator competing with Serve for the same job.
+            deployment_config:
+              # ONE DP GROUP. Ray turns this into 8 Serve replicas. See the counting rule above.
+              num_replicas: 1
+              ray_actor_options:
+                # The gang placement group holds the GPUs -- one bundle per rank -- not the
+                # replica actors. Same reasoning as 11.
+                num_gpus: 0
+  rayClusterConfig:
+    rayVersion: "2.58.0"
+    headGroupSpec:
+      rayStartParams:
+        num-gpus: "0"
+        dashboard-host: 0.0.0.0
+      template:
+        metadata:
+          # Stable selector for the Service at the bottom -- see 11 for why KubeRay's own
+          # ray.io/cluster label cannot be used.
+          labels:
+            app: v4-flash-openai
+        spec:
+          containers:
+            - name: ray-head
+              image: vllm/vllm-openai:v0.27.1
+              env:
+                - { name: PYTHONPATH, value: /models/ray-site-258 }
+                - { name: PATH, value: "/models/ray-site-258/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
+                - { name: HF_HOME, value: /models/hf-cache }
+                - { name: VLLM_ATTENTION_BACKEND, value: FLASHINFER }
+                - { name: VLLM_USE_BREAKABLE_CUDAGRAPH, value: "1" }
+              resources:
+                requests: { cpu: "8", memory: 32Gi }
+                limits:   { cpu: "16", memory: 64Gi }
+              volumeMounts:
+                - { name: models, mountPath: /models }
+                - { name: shm, mountPath: /dev/shm }
+          volumes:
+            - name: models
+              persistentVolumeClaim: { claimName: v4-flash-models }
+            - name: shm
+              emptyDir: { medium: Memory, sizeLimit: 32Gi }
+    workerGroupSpecs:
+      - groupName: gpu8
+        replicas: 1
+        minReplicas: 1
+        maxReplicas: 1
+        rayStartParams:
+          num-gpus: "8"
+        template:
+          spec:
+            nodeSelector:
+              node.kubernetes.io/instance-type: g.192.b200.8
+            containers:
+              - name: ray-worker
+                image: vllm/vllm-openai:v0.27.1
+                env:
+                  - { name: PYTHONPATH, value: /models/ray-site-258 }
+                  - { name: PATH, value: "/models/ray-site-258/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
+                  - { name: HF_HOME, value: /models/hf-cache }
+                  - { name: VLLM_ATTENTION_BACKEND, value: FLASHINFER }
+                  - { name: VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR, value: /root/.cache/flashinfer }
+                  - { name: VLLM_USE_BREAKABLE_CUDAGRAPH, value: "1" }
+                resources:
+                  requests: { cpu: "80", memory: 900Gi, nvidia.com/gpu: 8 }
+                  limits:   { cpu: "160", memory: 1400Gi, nvidia.com/gpu: 8 }
+                volumeMounts:
+                  - { name: models, mountPath: /models }
+                  - { name: shm, mountPath: /dev/shm }
+                  # Node-local JIT caches. Eight DP ranks compiling the same MoE kernels from
+                  # cold is eight times the work for one cache's worth of result.
+                  - { name: jit-cache, mountPath: /root/.cache }
+                  - { name: tilelang-cache, mountPath: /root/.tilelang }
+            volumes:
+              - name: models
+                persistentVolumeClaim: { claimName: v4-flash-models }
+              - name: shm
+                emptyDir: { medium: Memory, sizeLimit: 200Gi }
+              - name: jit-cache
+                hostPath: { path: /var/lib/v4-flash/vllm-cache, type: DirectoryOrCreate }
+              - name: tilelang-cache
+                hostPath: { path: /var/lib/v4-flash/tilelang-cache, type: DirectoryOrCreate }
+---
+# Keeps the endpoint name the demo already uses. See 11's Service for the reasoning.
+#
+# NOTE: a Service of this name already existed, created by 03-raycluster.yaml and selecting
+# ray.io/cluster=v4-flash. That RayCluster is gone, so the old Service still resolves but has no
+# endpoints behind it -- a name that answers DNS and refuses connections, which is the failure
+# mode that makes a demo look like a network problem. Applying this file retargets it in place;
+# spec.selector is mutable, so no delete is needed (only clusterIP would have been immutable,
+# and this file does not set one).
+apiVersion: v1
+kind: Service
+metadata:
+  name: v4-flash-openai
+  namespace: v4-flash-demo
+spec:
+  selector:
+    app: v4-flash-openai
+  ports:
+    - { name: http, port: 8000, targetPort: 8000 }
+    - { name: dashboard, port: 8265, targetPort: 8265 }

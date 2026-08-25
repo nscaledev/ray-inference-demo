@@ -13,12 +13,13 @@
 # at 1,704 tok/s, both with zero failed requests, after eight rounds of review had passed over
 # them looking only at the measurement plumbing.
 #
-# Order is dictated by the 24 GPUs on three machines, with the Ray head permanently holding 8:
-#     A  (Deployment, 8)          8 + 8 = 16   ok
-#     B  (RayJob on the head)         8        ok
-#     B-nospec (RayJob)               8        ok
-#     D  (2 replicas, 16)        16 + 8 = 24   exactly full
-#     1M (Deployment, 8)          8 + 8 = 16   ok, but only once D is down
+# Order is dictated by the 24 GPUs on three machines. Each RayService owns its cluster, and its
+# head holds no GPUs, so a strategy's cost is exactly its worker group:
+#     A  (RayService, 8)              8        ok
+#     B  (RayService, 8)              8        ok
+#     B-nospec (RayService, 8)        8        ok
+#     D  (2 replicas, 16)            16        ok
+#     1M (RayService, 8)              8        ok, but only once D is down
 set -uo pipefail
 export KUBECONFIG="${KUBECONFIG:-$(cd .. && pwd)/ray-demo-kubeconfig.yaml}"
 cd "$(dirname "$0")"
@@ -54,9 +55,8 @@ times_report() {
 # finish warming these engines -- strategy A is still climbing at its third loaded pass
 # (measured: 2336 2509 2813 2815 on one node, 2410 2356 2501 2731 on another). So if `run-X`'s
 # bench dies, the repeat passes that follow are the engine's 1st-3rd rather than its 2nd-4th,
-# the warm median lands mid-ramp, and the strategy reads ~14% slow for no physical reason.
-# That happened here and read as post-stress degradation until two pinned reruns refuted it.
-# Never let it pass quietly again.
+# the warm median lands mid-ramp, and the strategy reads ~14% slow for no physical reason —
+# indistinguishable from a real regression. So this must never fail quietly.
 run_leg() {   # run_leg "<label>" <just-recipe>
   local label="$1"; shift
   if ! "$@" 2>&1 | keep; then
@@ -69,12 +69,10 @@ keep() { grep -E "ready:|sanity:|aggregate |TTFT p50|wrote metrics|snapshot|need
 
 say "CLEAN STATE"
 just teardown 2>&1 | tail -2
-kubectl -n v4-flash-demo delete rayjob --all --ignore-not-found >/dev/null 2>&1
-just _wait-head-idle
-echo "--- nothing should be serving, but the cluster and PVC must remain ---"
+echo "--- nothing should be serving, but the PVC and weights must remain ---"
 just state 2>/dev/null | sed -n '/RayCluster/,$p'
 
-say "A · TEP8 (10b, Deployment with its own Ray)"
+say "A · TEP8 (RayService)"
 run_leg "A · TEP8" just run-a
 just ask-a "What is 2+2? Reply with only the number." 0.0 2>&1 | tail -2
 just repeat-bench bench-a A-tep8 3 "e2e" 2>&1 | keep
@@ -94,10 +92,8 @@ just probe-d 2>&1 | tail -4
 just repeat-bench bench-d D-replicas 3 "e2e" 2>&1 | keep
 
 say "1M window"
-just teardown 2>&1 | tail -1
-kubectl apply -f 50-longctx-1m.yaml >/dev/null 2>&1
-kubectl -n v4-flash-demo rollout status deploy/v4-flash-longctx --timeout=40m 2>&1 | tail -1
-just ask-1m "In one sentence: why does a longer context cost cache rather than compute?" 2>&1 | tail -2
+run_leg "1M window" just run-1m
+just ask "In one sentence: why does a longer context cost cache rather than compute?" 2>&1 | tail -2
 just longctx 2>&1 | keep
 just longctx-sweep 2>&1 | keep
 

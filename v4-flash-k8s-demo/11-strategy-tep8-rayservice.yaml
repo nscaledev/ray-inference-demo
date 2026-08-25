@@ -1,0 +1,225 @@
+# 11 — STRATEGY A: tensor parallelism across 8 GPUs with expert parallelism, as a RayService.
+#
+#     kubectl apply -f 11-strategy-tep8-rayservice.yaml
+#     kubectl -n v4-flash-demo wait --for=condition=Ready rayservice/v4-flash-a --timeout=40m
+#     just ask-a
+#
+# ⚠ EDITING A LIVE RAYSERVICE ON A FULL CLUSTER DEADLOCKS. A RayService upgrade is zero-downtime
+# by design: KubeRay stands up a SECOND RayCluster and only retires the old one once the new one
+# is serving. When the three demo engines hold all 24 GPUs there is nowhere to put the second
+# cluster, so its worker sits Pending on "Insufficient nvidia.com/gpu" while the old cluster --
+# which is holding those GPUs -- waits to be replaced. Neither side can move, and the RayService
+# reports a healthy `active` alongside a `pending` that will never arrive.
+# On a cluster with no spare capacity, replace instead of upgrading:
+#     kubectl delete rayservice v4-flash-a && kubectl apply -f 11-strategy-tep8-rayservice.yaml
+#
+# RayService is the CRD for an inference endpoint. It owns the RayCluster, health-checks the
+# Serve application, publishes a Ready condition you can wait on, and does zero-downtime config
+# updates by standing up a second cluster before shifting traffic. A RayJob models a submitter
+# process instead, so its status describes the submitter and not the engine behind it.
+#
+# ─── ONE NON-OBVIOUS REQUIREMENT: VLLM_USE_BREAKABLE_CUDAGRAPH IN THE POD ENV ─────────────────
+#
+# vLLM auto-enables this variable for DeepseekV4ForCausalLM (and several other recent
+# architectures) by writing to os.environ inside the engine-core process, which also forces
+# compilation mode to NONE. Whether the tensor-parallel workers observe that write depends on
+# how they were created:
+#
+#   mp / uniproc executor   the worker IS the engine-core process, or a forked child of it,
+#                           so the value is present                                -> agrees
+#   ray executor            the workers are actors of a raylet that started BEFORE the
+#                           write, so they only ever see the pod's env             -> disagrees
+#
+# Under KubeRay the raylet starts at pod boot, which is always before the engine runs. The ranks
+# then build a cudagraph and compilation configuration that disagrees with rank 0's:
+#
+#   AssertionError: Compilation mode should be CompilationMode.VLLM_COMPILE when cudagraph_mode
+#   piecewise cudagraphs is used ... cudagraph_mode=FULL_AND_PIECEWISE, compilation_mode=0
+#
+# Setting the variable in the POD env makes every process read the same value. The general rule:
+# a vLLM engine with TP > 1 on the ray executor, inside a Ray cluster it did not start itself,
+# must have this pinned explicitly. An engine that starts its own Ray (ray.init() from the
+# engine process) inherits it and needs nothing, which is why the same flags can behave
+# differently under different orchestration.
+#
+# ─── LAYOUT ───────────────────────────────────────────────────────────────────────────────────
+#
+#   * Ray 2.58.0, staged on the PVC at /models/ray-site-258 by 02b. ray.serve.llm ships in the
+#     llm extra and is what lets Serve own the engine's placement.
+#   * The head holds NO GPUs: it runs the GCS, the dashboard and the Serve controller. The
+#     worker group holds the eight GPUs the engine uses. Keeping control plane and engine on
+#     separate nodes means head-side work never competes with the engine for a device.
+apiVersion: ray.io/v1
+kind: RayService
+metadata:
+  name: v4-flash-a
+  namespace: v4-flash-demo
+spec:
+  # Serve's own health checking. This is the readiness signal a RayJob could not give us: it
+  # reports on the APPLICATION, not on a submitter process.
+  serviceUnhealthySecondThreshold: 1200
+  deploymentUnhealthySecondThreshold: 1200
+  serveConfigV2: |
+    applications:
+      - name: llm
+        route_prefix: /
+        import_path: ray.serve.llm:build_openai_app
+        args:
+          llm_configs:
+            - model_loading_config:
+                model_id: deepseek-ai/DeepSeek-V4-Flash-0731
+                model_source: /models/DeepSeek-V4-Flash-0731
+              # These are vLLM's EngineArgs field names, so the CLI's --tensor-parallel-size is
+              # tensor_parallel_size here.
+              engine_kwargs:
+                # Place the TP workers in the placement group Serve built, rather than having
+                # vLLM spawn eight local processes of its own.
+                #
+                # Note for anyone reading a traceback from this path: AsyncLLM always drives the
+                # engine core over an MP client, so seeing make_async_mp_client does not mean
+                # this setting was ignored. It governs how the engine core's WORKERS are
+                # created, not how the engine core itself is reached.
+                distributed_executor_backend: ray
+                tensor_parallel_size: 8
+                enable_expert_parallel: true
+                trust_remote_code: true
+                kv_cache_dtype: fp8
+                block_size: 256
+                tokenizer_mode: deepseek_v4
+                tool_call_parser: deepseek_v4
+                enable_auto_tool_choice: true
+                reasoning_parser: deepseek_v4
+                max_model_len: 262144
+              deployment_config:
+                num_replicas: 1
+                # ZERO GPUs ON THE REPLICA ACTOR, deliberately. Ray Serve LLM builds its own
+                # placement group sized to tensor_parallel_size, and that group holds the GPUs.
+                # Requesting 8 here as well double-counts, and Ray asks for
+                #   {'CPU': 1.0, 'GPU': 9.0} * 1, {'GPU': 1.0} * 7  (PACK)
+                # which is 16 GPUs on an 8-GPU node. The placement group then never schedules.
+                #
+                # Worth knowing how that presents: the application status stays DEPLOYING, which
+                # looks like slow progress rather than a hard stop. `ray status` names it
+                # immediately under "Pending Demands" -- check there before waiting on a status
+                # string.
+                ray_actor_options:
+                  num_gpus: 0
+  rayClusterConfig:
+    rayVersion: "2.58.0"
+    headGroupSpec:
+      rayStartParams:
+        num-gpus: "0"          # the head coordinates; it does not serve
+        dashboard-host: 0.0.0.0
+      template:
+        metadata:
+          # A label of our own, not one of KubeRay's. KubeRay labels these pods with
+          # ray.io/cluster=v4-flash-a-<generated>, and that suffix changes on every redeploy, so
+          # nothing static can select on it. This label is stable, which is what lets the
+          # Service at the bottom of this file keep a fixed endpoint name.
+          labels:
+            app: v4-flash-tep8
+        spec:
+          containers:
+            - name: ray-head
+              image: vllm/vllm-openai:v0.27.1
+              env:
+                - { name: PYTHONPATH, value: /models/ray-site-258 }
+                - { name: PATH, value: "/models/ray-site-258/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
+                - { name: HF_HOME, value: /models/hf-cache }
+                - { name: VLLM_ATTENTION_BACKEND, value: FLASHINFER }
+                # Must match the worker group. ray_actor_options.num_gpus is 0, so the LLMServer
+                # replica -- the process that hosts the engine core -- can be scheduled here.
+                # If the two groups disagreed, rank 0 and its workers would build different
+                # graphs again.
+                - { name: VLLM_USE_BREAKABLE_CUDAGRAPH, value: "1" }
+                # NOT SET: RAY_SERVE_LLM_ENABLE_DIRECT_STREAMING. It is the obvious lever for the
+                # cost described below -- it attaches LLMRouter as the request router and drops
+                # the separate OpenAiIngress actor -- but it needs `RAY_SERVE_ENABLE_HA_PROXY=1`
+                # and the vLLM image has no haproxy binary (Ray ships the Python glue only).
+                # Enabling it here fails the deployment outright:
+                #   `ingress_request_router` requires HAProxy. Set `RAY_SERVE_ENABLE_HA_PROXY=1`
+                # Revisit if the image ever gains haproxy; it is the fix, just not an available
+                # one on this image.
+                #
+                # THE COST IT WOULD REMOVE, measured: Serve routes every request and every
+                # streamed token through one extra actor before the engine. Moving this exact
+                # engine from a plain Deployment to a RayService cost 12% aggregate (2512.7 ->
+                # 2209.2 tok/s) and roughly doubled single-stream TTFT (0.067s -> 0.141s), while
+                # leaving TPOT unchanged -- so it is a fixed per-request overhead, not a slower
+                # engine. That is the price of Serve's health-checking and zero-downtime updates.
+              resources:
+                requests: { cpu: "8", memory: 32Gi }
+                limits:   { cpu: "16", memory: 64Gi }
+              volumeMounts:
+                - { name: models, mountPath: /models }
+                - { name: shm, mountPath: /dev/shm }
+          volumes:
+            - name: models
+              persistentVolumeClaim: { claimName: v4-flash-models }
+            - name: shm
+              emptyDir: { medium: Memory, sizeLimit: 32Gi }
+    workerGroupSpecs:
+      - groupName: gpu8
+        replicas: 1
+        minReplicas: 1
+        maxReplicas: 1
+        rayStartParams:
+          num-gpus: "8"
+        template:
+          spec:
+            nodeSelector:
+              node.kubernetes.io/instance-type: g.192.b200.8
+            containers:
+              - name: ray-worker
+                image: vllm/vllm-openai:v0.27.1
+                env:
+                  - { name: PYTHONPATH, value: /models/ray-site-258 }
+                  - { name: PATH, value: "/models/ray-site-258/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
+                  - { name: HF_HOME, value: /models/hf-cache }
+                  - { name: VLLM_ATTENTION_BACKEND, value: FLASHINFER }
+                  - { name: VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR, value: /root/.cache/flashinfer }
+                  # REQUIRED for TP > 1 on the ray executor -- see this file's header. Value 1
+                  # rather than 0: 1 is what vLLM selects for this architecture on its own, so
+                  # this pins the engine's own choice and makes it visible to the actors, which
+                  # would otherwise not see it.
+                  - { name: VLLM_USE_BREAKABLE_CUDAGRAPH, value: "1" }
+                resources:
+                  requests: { cpu: "80", memory: 900Gi, nvidia.com/gpu: 8 }
+                  limits:   { cpu: "160", memory: 1400Gi, nvidia.com/gpu: 8 }
+                volumeMounts:
+                  - { name: models, mountPath: /models }
+                  - { name: shm, mountPath: /dev/shm }
+                  # Node-local JIT caches. Without them every restart repays FlashInfer autotune
+                  # (measured at 8m19s on this hardware) and ~1,250 DeepGEMM kernels from cold,
+                  # which is the difference between a roughly four-minute and a twenty-minute
+                  # start.
+                  - { name: jit-cache, mountPath: /root/.cache }
+                  - { name: tilelang-cache, mountPath: /root/.tilelang }
+            volumes:
+              - name: models
+                persistentVolumeClaim: { claimName: v4-flash-models }
+              - name: shm
+                emptyDir: { medium: Memory, sizeLimit: 200Gi }
+              - name: jit-cache
+                hostPath: { path: /var/lib/v4-flash/vllm-cache, type: DirectoryOrCreate }
+              - name: tilelang-cache
+                hostPath: { path: /var/lib/v4-flash/tilelang-cache, type: DirectoryOrCreate }
+---
+# STABLE ENDPOINT NAME. KubeRay creates v4-flash-a-serve-svc, whose name embeds a generated
+# cluster suffix. This Service gives the endpoint a fixed name instead, so the tooling and the
+# recorded bench artifacts keep referring to one address while the orchestration underneath it
+# changes.
+#
+# Serve runs an HTTP proxy on every node in the cluster, head included, so pointing at the head
+# is enough; the proxy routes to whichever node holds the replica.
+apiVersion: v1
+kind: Service
+metadata:
+  name: v4-flash-tep8
+  namespace: v4-flash-demo
+spec:
+  selector:
+    app: v4-flash-tep8
+  ports:
+    - { name: http, port: 8000, targetPort: 8000 }
+    - { name: dashboard, port: 8265, targetPort: 8265 }

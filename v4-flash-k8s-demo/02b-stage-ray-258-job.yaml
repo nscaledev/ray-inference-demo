@@ -1,0 +1,115 @@
+# 02b — stage Ray 2.58.0 (with the LLM extras) into a SEPARATE overlay on the PVC.
+#
+#     kubectl apply -f 02b-stage-ray-258-job.yaml
+#     kubectl -n v4-flash-demo logs -f job/stage-ray-258
+#
+# WHY A SECOND DIRECTORY. /models/ray-site holds ray 2.49.0 and every running engine has it on
+# PYTHONPATH. Overwriting it would change A, B, D and the 1M engine simultaneously, with no way
+# back except re-staging. This writes /models/ray-site-258 instead, so switching is one env var
+# per manifest and rolling back is the same edit reversed.
+#
+# WHY 2.58.0. Running 2.49.0, current is 2.58.0 -- eighteen releases behind. And 2.49.0's
+# ray[default] does not carry ray.serve.llm, which is the module that makes a RayService serve
+# vLLM properly instead of us submitting a `vllm serve` entrypoint into a cluster and hoping
+# Ray's actor-to-device assignment matches what vLLM's tensor-parallel ranks expect. That
+# mismatch is the leading explanation for TP8 answering "What is 2+2?" with Go imports as a
+# RayJob while the identical flags answer "4" as a Deployment.
+#
+# WHY ray[llm] AND NOT ray[default]. ray.serve.llm lives in the llm extra. It depends on vllm,
+# which THIS IMAGE ALREADY HAS at the version the demo is pinned to (0.27.1) -- so the prune
+# step below deletes the overlay's copy and lets the image's win. Same rule 02 established:
+# never let the overlay shadow vllm's own pins.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: stage-ray-258
+  namespace: v4-flash-demo
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: stage
+          image: vllm/vllm-openai:v0.27.1
+          env:
+            - { name: RAY_VERSION, value: "2.58.0" }
+            - { name: TARGET, value: /models/ray-site-258 }
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -uo pipefail
+              echo "=== staging ray ${RAY_VERSION} into ${TARGET}"
+              echo "    image ships vllm $(python3 -c 'import vllm;print(vllm.__version__)')"
+              if [ -x "${TARGET}/bin/ray" ]; then
+                echo "already staged: $(PYTHONPATH=${TARGET} ${TARGET}/bin/ray --version)"
+              else
+                # uv resolves this in seconds; pip backtracks for many minutes
+                command -v uv >/dev/null && PIP="uv pip" || PIP="python3 -m pip"
+                $PIP install -q --target "${TARGET}" "ray[default,llm]==${RAY_VERSION}" || {
+                  echo "ray[default,llm] failed; falling back to ray[default]"
+                  $PIP install -q --target "${TARGET}" "ray[default]==${RAY_VERSION}"; }
+              fi
+              echo "=== pruning anything the image already provides (except ray itself)"
+              python3 - <<'PY'
+              import os, pathlib, shutil, site
+              target = pathlib.Path(os.environ["TARGET"])
+              image = {p.name
+                       for d in site.getsitepackages() if pathlib.Path(d).is_dir()
+                       for p in pathlib.Path(d).iterdir()}
+              pruned = 0
+              for p in sorted(target.iterdir()):
+                  if p.name in image and not p.name.startswith("ray"):
+                      shutil.rmtree(p, ignore_errors=True) if p.is_dir() else p.unlink()
+                      pruned += 1
+              print(f"    pruned {pruned} duplicate top-level entries")
+              # AND their metadata. Deleting a package directory but leaving its *.dist-info
+              # is worse than not pruning at all: importlib.metadata still reports the
+              # distribution as living in the overlay, so a loader that derives a native
+              # library path from metadata points at a directory that is gone. That is exactly
+              # what happened -- apache_tvm_ffi-0.1.10.dist-info survived (its DISTRIBUTION
+              # name does not match the IMPORT name "tvm_ffi" the image provides), and the
+              # image's own tvm_ffi then tried to dlopen
+              # /models/ray-site-258/tvm_ffi/lib/libtvm_ffi.so and failed. That killed every
+              # Serve replica with DEPLOY_FAILED.
+              # Note the survivor test EXCLUDES the dist-info's own directory: counting its own
+              # files as survivors is why a first attempt at this cleanup matched nothing.
+              dangling = 0
+              for d in sorted(target.glob("*.dist-info")):
+                  rec = d / "RECORD"
+                  tops = set()
+                  if rec.is_file():
+                      for line in rec.read_text(errors="ignore").splitlines():
+                          entry = line.split(",")[0]
+                          if "/" in entry:
+                              top = entry.split("/")[0]
+                              if top != d.name:          # ignore its own metadata files
+                                  tops.add(top)
+                  if tops and not any((target / x).exists() for x in tops):
+                      shutil.rmtree(d, ignore_errors=True)
+                      dangling += 1
+              print(f"    pruned {dangling} dist-info dirs whose package was pruned")
+              PY
+              echo "=== what we ended up with"
+              du -sh "${TARGET}" 2>/dev/null
+              PYTHONPATH=${TARGET} python3 - <<'PY'
+              import importlib, os
+              for m in ("ray", "ray.serve", "ray.serve.llm", "vllm"):
+                  try:
+                      mod = importlib.import_module(m)
+                      v = getattr(mod, "__version__", "-")
+                      print(f"    {m:<16} {v:<10} {mod.__file__}")
+                  except Exception as exc:
+                      print(f"    {m:<16} MISSING  {type(exc).__name__}: {exc}")
+              PY
+              echo "=== done. 2.49.0 at /models/ray-site is untouched:"
+              ls -d /models/ray-site >/dev/null 2>&1 && echo "    intact" || echo "    MISSING?!"
+          volumeMounts:
+            - { name: models, mountPath: /models }
+          resources:
+            requests: { cpu: "4", memory: 16Gi }
+            limits:   { cpu: "8", memory: 32Gi }
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: v4-flash-models

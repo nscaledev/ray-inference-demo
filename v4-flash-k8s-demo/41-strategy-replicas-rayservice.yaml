@@ -1,0 +1,187 @@
+# 41 — STRATEGY D: whole replicas of strategy A, scaled out across machines, as a RayService.
+#
+#     kubectl apply -f 41-strategy-replicas-rayservice.yaml
+#     kubectl -n v4-flash-demo wait --for=condition=Ready rayservice/v4-flash-d --timeout=45m
+#     just bench-d
+#
+# D is strategy A duplicated, not a different parallelism: each replica is TP8 + EP inside one
+# NVLink domain, and there are two of them on two machines. 16 GPUs, so D cannot share the
+# cluster with A, B and the 1M engine (which take all 24 between them).
+#
+# SCALE-OUT IS ONE FIELD: deployment_config.num_replicas. Serve builds one TP8 placement group
+# per replica and routes across them, which replaces the Service-level load balancing this
+# strategy used as a Deployment. The engine config below is byte-identical to 11's, because the
+# claim being measured is "the same shape, twice" — any other difference would confound it.
+#
+# WHY THE WORKER GROUP IS replicas: 2 RATHER THAN ONE POD WITH 16 GPUs: no machine here has 16.
+# Each pod requests 8 and the nodes have exactly 8, so Kubernetes necessarily places one pod per
+# machine. That is also what keeps each replica's tensor parallelism inside a single NVLink
+# domain — the property the whole strategy depends on.
+#
+# VLLM_USE_BREAKABLE_CUDAGRAPH is required for the same reason as in 11: TP8 on the ray executor
+# under a KubeRay-managed cluster, so the workers are actors that never observe the variable the
+# engine sets for itself at runtime.
+apiVersion: ray.io/v1
+kind: RayService
+metadata:
+  name: v4-flash-d
+  namespace: v4-flash-demo
+spec:
+  serviceUnhealthySecondThreshold: 2400
+  deploymentUnhealthySecondThreshold: 2400
+  serveConfigV2: |
+    applications:
+      - name: llm
+        route_prefix: /
+        import_path: ray.serve.llm:build_openai_app
+        args:
+          # GIVE THE INGRESS ROOM. build_openai_app creates exactly ONE OpenAiIngress actor
+          # regardless of how many engine replicas sit behind it, and every request AND every
+          # streamed token is relayed through it. With two engine replicas at 32 requests each,
+          # that single Python process is the narrowest thing in the path, and it saturates
+          # before the GPUs do: measured 2751 / 491 / 2641 tok/s across three passes with TTFT
+          # p95 reaching 30.5s. Those numbers describe the funnel, not the fleet.
+          #
+          # One ingress replica per engine replica. This is not a magic number -- it is the
+          # smallest thing that stops the ingress being a single point of serialisation, and it
+          # should be revisited if num_replicas above changes.
+          #
+          # The cleaner fix is RAY_SERVE_LLM_ENABLE_DIRECT_STREAMING, which removes the separate
+          # ingress entirely. It requires RAY_SERVE_ENABLE_HA_PROXY=1 and the vLLM image has no
+          # haproxy binary, so it fails the deployment on this image. See 11's head env.
+          ingress_deployment_config:
+            num_replicas: 2
+          llm_configs:
+            - model_loading_config:
+                model_id: deepseek-ai/DeepSeek-V4-Flash-0731
+                model_source: /models/DeepSeek-V4-Flash-0731
+              # THE ONE SETTING D NEEDS AND 11 DOES NOT.
+              #
+              # Serve's default placement strategy is PACK, which its own source describes as
+              # "cross-node best-effort": it prefers to put a replica's 8 bundles on one node,
+              # but it is permitted to split them if that is easier to schedule. For A and the
+              # 1M engine that cannot happen -- their clusters contain exactly 8 GPUs, so the
+              # only packing available is the correct one. THIS cluster has 16, so a replica
+              # could be placed 5 GPUs on one machine and 3 on the other.
+              #
+              # That failure is silent and expensive: a straddled replica does its expert
+              # routing over the 200G Ethernet instead of NVLink, and the only symptom is a
+              # throughput number that looks like a bad day. STRICT_PACK makes one-node
+              # placement a scheduling requirement, so a replica that cannot fit on a single
+              # machine stays pending and says so instead of quietly running slowly.
+              #
+              # Verify rather than assume, on any cluster where more than one node could hold
+              # a replica:
+              #   ray list placement-groups --detail --format yaml | grep -A2 bundle_index
+              # every bundle of one placement group must report the same node_id.
+              # bundle_per_worker is REQUIRED alongside strategy -- pydantic rejects a config
+              # that sets only the strategy ("must specify either 'bundle_per_worker' or
+              # 'bundles'"), and it rejects it at app-build time, so the RayService reports
+              # DEPLOY_FAILED after the pods are already up. One GPU per worker, expanded to
+              # tensor_parallel_size bundles.
+              placement_group_config:
+                strategy: STRICT_PACK
+                bundle_per_worker:
+                  GPU: 1
+              # Otherwise identical to 11. Do not tune one and not the other.
+              engine_kwargs:
+                distributed_executor_backend: ray
+                tensor_parallel_size: 8
+                enable_expert_parallel: true
+                trust_remote_code: true
+                kv_cache_dtype: fp8
+                block_size: 256
+                tokenizer_mode: deepseek_v4
+                tool_call_parser: deepseek_v4
+                enable_auto_tool_choice: true
+                reasoning_parser: deepseek_v4
+                max_model_len: 262144
+              deployment_config:
+                # THE WHOLE STRATEGY, IN ONE FIELD. Two replicas, each holding its own TP8
+                # placement group of 8 GPUs.
+                num_replicas: 2
+                ray_actor_options:
+                  num_gpus: 0
+  rayClusterConfig:
+    rayVersion: "2.58.0"
+    headGroupSpec:
+      rayStartParams:
+        num-gpus: "0"
+        dashboard-host: 0.0.0.0
+      template:
+        metadata:
+          labels:
+            app: v4-flash-replicas
+        spec:
+          containers:
+            - name: ray-head
+              image: vllm/vllm-openai:v0.27.1
+              env:
+                - { name: PYTHONPATH, value: /models/ray-site-258 }
+                - { name: PATH, value: "/models/ray-site-258/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
+                - { name: HF_HOME, value: /models/hf-cache }
+                - { name: VLLM_ATTENTION_BACKEND, value: FLASHINFER }
+                - { name: VLLM_USE_BREAKABLE_CUDAGRAPH, value: "1" }
+              resources:
+                requests: { cpu: "8", memory: 32Gi }
+                limits:   { cpu: "16", memory: 64Gi }
+              volumeMounts:
+                - { name: models, mountPath: /models }
+                - { name: shm, mountPath: /dev/shm }
+          volumes:
+            - name: models
+              persistentVolumeClaim: { claimName: v4-flash-models }
+            - name: shm
+              emptyDir: { medium: Memory, sizeLimit: 32Gi }
+    workerGroupSpecs:
+      - groupName: gpu8
+        # Two pods of 8 GPUs. The nodes have exactly 8 each, so this is one replica per machine.
+        replicas: 2
+        minReplicas: 2
+        maxReplicas: 2
+        rayStartParams:
+          num-gpus: "8"
+        template:
+          spec:
+            nodeSelector:
+              node.kubernetes.io/instance-type: g.192.b200.8
+            containers:
+              - name: ray-worker
+                image: vllm/vllm-openai:v0.27.1
+                env:
+                  - { name: PYTHONPATH, value: /models/ray-site-258 }
+                  - { name: PATH, value: "/models/ray-site-258/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
+                  - { name: HF_HOME, value: /models/hf-cache }
+                  - { name: VLLM_ATTENTION_BACKEND, value: FLASHINFER }
+                  - { name: VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR, value: /root/.cache/flashinfer }
+                  - { name: VLLM_USE_BREAKABLE_CUDAGRAPH, value: "1" }
+                resources:
+                  requests: { cpu: "80", memory: 900Gi, nvidia.com/gpu: 8 }
+                  limits:   { cpu: "160", memory: 1400Gi, nvidia.com/gpu: 8 }
+                volumeMounts:
+                  - { name: models, mountPath: /models }
+                  - { name: shm, mountPath: /dev/shm }
+                  - { name: jit-cache, mountPath: /root/.cache }
+                  - { name: tilelang-cache, mountPath: /root/.tilelang }
+            volumes:
+              - name: models
+                persistentVolumeClaim: { claimName: v4-flash-models }
+              - name: shm
+                emptyDir: { medium: Memory, sizeLimit: 200Gi }
+              - name: jit-cache
+                hostPath: { path: /var/lib/v4-flash/vllm-cache, type: DirectoryOrCreate }
+              - name: tilelang-cache
+                hostPath: { path: /var/lib/v4-flash/tilelang-cache, type: DirectoryOrCreate }
+---
+# Keeps the endpoint name the bench recipes and recorded artifacts already use.
+apiVersion: v1
+kind: Service
+metadata:
+  name: v4-flash-replicas
+  namespace: v4-flash-demo
+spec:
+  selector:
+    app: v4-flash-replicas
+  ports:
+    - { name: http, port: 8000, targetPort: 8000 }
+    - { name: dashboard, port: 8265, targetPort: 8265 }

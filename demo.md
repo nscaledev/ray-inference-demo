@@ -14,11 +14,15 @@ is where the doubt gets settled.
 
 **Three engines, three machines, 24 of 24 GPUs, nothing started on stage:**
 
-| service | strategy | parallelism | where it runs |
+| service | strategy | parallelism | how it is served |
 |---|---|---|---|
-| `v4-flash-tep8` | **A** — the latency shape | TP8 + EP | a Deployment with its own local Ray |
-| `v4-flash-openai` | **B** — the published reference | DP8 × EP + DSpark | a RayJob inside the Ray head's 8 GPUs |
-| `v4-flash-longctx` | **1M window** | TP8 + EP, `--max-model-len 1048576` | a Deployment |
+| `v4-flash-tep8` | **A** — the latency shape | TP8 + EP | RayService (`v4-flash-a`) |
+| `v4-flash-openai` | **B** — the published reference | DP8 × EP + DSpark | RayService (`v4-flash-b`) |
+| `v4-flash-longctx` | **1M window** | TP8 + EP, `max_model_len: 1048576` | RayService (`v4-flash-1m`) |
+
+All three are RayServices: one CRD per strategy, each owning its own RayCluster with the head
+holding no GPUs and one 8-GPU worker group. The service names above are stable aliases, so the
+tooling and the recorded measurements refer to one address per strategy.
 
 **Strategy C is deliberately not running.** It is the broken shape — TP4 prefill answers in
 fluent nonsense — and everything the demo needs from it is already on disk in
@@ -28,7 +32,7 @@ the deck's headline claim from an assertion into a live comparison.
 
 ---
 
-## 1 · Pre-demo setup — start 60 minutes out (measured 9m 15s; budget 30)
+## 1 · Pre-demo setup — start 60 minutes out (measured 22m 06s; budget 40)
 
 A cold engine start is **not the weights** — it is ~1,200 DeepGEMM JIT compiles, a FlashInfer
 autotune and CUDA graph capture. That is longer than the whole slot, which is why nothing starts
@@ -39,58 +43,58 @@ on stage. Strategy **D** is never started; its numbers come from `metrics/*.json
 
 | engine | ready after | readiness signal |
 |---|---|---|
-| B | **5m 16s** | `/v1/models` answers — *weak, see below* |
-| A | **8m 30s** | `startupProbe`, which requires a real generation |
-| 1M | **8m 53s** | same |
-| **total from `just teardown`** | **9m 15s** | |
+| B | **13m 46s** | RayService `Ready` condition |
+| 1M | **16m 35s** | same |
+| A | **22m 06s** | same |
+| **total from `just teardown`** | **22m 06s** | they warm in parallel, so the total is the slowest |
 
 Two caveats, both load-bearing:
 
-**The three "ready" lines do not mean the same thing.** B is a RayJob with no Deployment to roll
-out, so it is polled with `wait-ready`, which only checks that `/v1/models` responds — an engine
-can answer that while still compiling kernels. A and the 1M engine wait on a `startupProbe` that
-passes only after a token has actually been generated. B arriving first may just mean its bar is
-lower. Step 5 is what actually settles it, for all three.
+**"Ready" now means the same thing for all three.** Each engine is a RayService, so each
+publishes a `Ready` condition set from Serve's own health check of the application — one signal,
+the same signal, waited on the same way. Even so, ready is not warm: kernels for a request shape
+compile on that shape's first request. Step 5 is what actually settles it.
 
-**The weights were already in the nodes' page cache** from earlier runs. On genuinely cold nodes
-expect longer — the 11–25 minute range is what this stack does from truly cold. Budget 30
-minutes and be pleasantly surprised.
+**22 minutes is with warm caches, and applying all three at once is the slow part.** All three
+read the 167 GB checkpoint from the same RWX PVC simultaneously, so they contend for it: the same
+engine loaded its weights in 2m 30s when it had the PVC to itself. On genuinely cold nodes expect
+longer still — a cold DeepGEMM warm-up alone is ~1,250 kernels, and one fully cold start measured
+27m 44s. Budget 40 minutes. If you are short of time, apply them one at a time rather than
+together; the total is similar but the first engine is usable much sooner.
 
 ```bash
 # 1. Point BARE kubectl at this cluster.
 #    The eval is required: a just recipe runs in a child process and cannot set the parent
 #    shell's env, so `just enable-kube` alone would look like it worked and change nothing.
-#    It also probes /readyz and prints the context to stderr — a wrong-cluster mistake
-#    surfaces here rather than on stage.
+#    It also probes /readyz and prints the context to stderr, so a wrong-cluster surfaces here
+#    rather than on stage.
 eval "$(just enable-kube)"
 
 # 2. One clean slate for all three engines.
-#    teardown removes every strategy deployment and rayjob but KEEPS the RayCluster and the
-#    model PVC — re-downloading 167 GB proves nothing. _ensure-cluster re-applies the
-#    RayCluster only if it has gone missing. B needs that cluster: it runs as a RayJob.
-just teardown && just _ensure-cluster
+#    teardown deletes every RayService — and with it the RayCluster each one owns — but KEEPS
+#    the model PVC, because re-downloading 167 GB proves nothing.
+just teardown
 
 # 3. All three engines in ONE declarative apply.
-#    They warm IN PARALLEL because they occupy different machines: B runs inside the Ray
-#    head's 8 GPUs, A and the 1M engine take a node each. That is 24 of 24 GPUs.
+#    They warm IN PARALLEL: each RayService schedules its 8-GPU worker group on a different
+#    machine, so this is 24 of 24 GPUs.
 #    Re-running is safe — whatever is already serving is left alone.
 #    Do NOT use `just run-a` or `just run-b` here: each begins with its own teardown, so the
-#    second would delete the first and they would warm sequentially (~50 min, not ~25).
-kubectl apply -f 10b-strategy-tep8-deployment.yaml \
-              -f 20-strategy-dp8-ep.yaml \
-              -f 50-longctx-1m.yaml
+#    second would delete the first and they would warm sequentially.
+kubectl apply -f 11-strategy-tep8-rayservice.yaml \
+              -f 21-strategy-dp8-ep-rayservice.yaml \
+              -f 51-longctx-1m-rayservice.yaml
 
 # 4. Wait for all three AT ONCE.
 #    This doesn't make it faster — they were already warming together from step 3. It makes a
 #    failure visible immediately instead of hiding behind a 20-minute wait on another engine.
-#    Each branch labels its own verdict; `wait` blocks until all three finish, so step 5
-#    cannot run against a half-warm cluster.
-#    B is a RayJob, so there is no Deployment to roll out — poll its endpoint instead.
-{ kubectl -n v4-flash-demo rollout status deploy/v4-flash-tep8 --timeout=40m >/dev/null \
+#    One signal for all three now: the RayService Ready condition, which Serve sets from its own
+#    health check of the application rather than from whether a process is alive.
+{ kubectl -n v4-flash-demo wait --for=condition=Ready rayservice/v4-flash-a --timeout=40m >/dev/null \
     && echo "✓ A ready" || echo "⛔ A FAILED"; } &
-{ just wait-ready 8000 v4-flash-openai 2400 >/dev/null 2>&1 \
+{ kubectl -n v4-flash-demo wait --for=condition=Ready rayservice/v4-flash-b --timeout=40m >/dev/null \
     && echo "✓ B ready" || echo "⛔ B FAILED"; } &
-{ kubectl -n v4-flash-demo rollout status deploy/v4-flash-longctx --timeout=40m >/dev/null \
+{ kubectl -n v4-flash-demo wait --for=condition=Ready rayservice/v4-flash-1m --timeout=40m >/dev/null \
     && echo "✓ 1M engine ready" || echo "⛔ 1M engine FAILED"; } &
 wait
 
@@ -114,13 +118,19 @@ wait
 #    and a narrowed set looks exactly like a clean one.
 just verify-output
 
-# 6. Prove the needle BEFORE you're on stage (measured 77 s, TTFT 63.9 s).
+# 6. Prove the needle BEFORE you're on stage (measured TTFT 63.7 s at 996,068 prompt tokens).
 #    A passphrase sits at the MIDPOINT of a 996K-token prompt — not the head, not the tail,
 #    because head-and-tail attention passes an edge needle test for free.
 #    If it fails on the day, quote the number from slide 6 instead of running it live.
 just longctx
 
-# 7. Sanity-check the closing beat's inputs.
+# 7. Warm every endpoint at the shape the demo will ask for.
+#    READY IS NOT WARM. The kernels for a request shape compile on that shape's FIRST request,
+#    so without this the demo's first asks pay the compile on stage — and an unwarmed engine
+#    reports a fraction of its real throughput while looking perfectly healthy.
+just warm
+
+# 8. Sanity-check the closing beat's inputs.
 #    compare reads metrics/*.json, so it also shows D (not serving) and C (never started, and
 #    rendered as ✗ because it failed the gate). CONFIRM THAT ✗ COLUMN IS THERE — beat 4
 #    depends on it. Leave the output in a spare terminal tab as network insurance.
@@ -135,8 +145,51 @@ as a fallback.
 
 ## 2 · The demo — ~16 minutes, six beats
 
-Each beat says what will appear on screen before the command, so you know what you are pointing
-at. Run them one at a time and talk in between.
+**The whole demo, in one block.** Run them one at a time and talk in between — the commands total
+under three minutes, so the rest of the slot is you. The annotated beats follow underneath.
+
+```bash
+# 1. The cluster, honestly: three machines, who holds all 24 GPUs, which endpoints answer.
+#    Point at the 24 and the three separate machine names.
+just state
+
+# 1b. The Ray dashboard — placement groups, actors, which GPU each rank got.
+#     BLOCKS until Ctrl-C, so give it its own tab; do not paste it mid-sequence.
+just dashboard
+
+# 2. It talks. One live answer, ~2 s. Says on screen that this is a SHORT prompt,
+#    not the million-token one — otherwise the room assumes they just saw that test.
+just ask
+
+# 3. Strategy A: TP8 + expert parallel, attention sliced 8 ways. Answers correctly.
+just ask-a
+
+# 4. Strategy B: the shape DeepSeek published, DP8 × EP + DSpark. Also correct.
+#    Note it hits a DIFFERENT Service — two engines, two machines, same weights.
+just ask-b
+
+# 5. The measured difference: warm medians, then seven claims, each printing the two
+#    numbers it divided so the arithmetic is checkable on screen.
+just claims
+
+# 6. What a throughput benchmark cannot see. Four columns carry numbers; C's carries ✗
+#    in every row because it failed the output check, so its timings are withheld.
+just compare
+
+# 7. The receipt behind that refusal: C ran at 1922.8 tok/s, zero failed requests,
+#    and answered "2+2" with a fragment of Java. Say out loud that C is not running.
+just receipt
+
+# 8. The 1M window, served and read: a passphrase at the midpoint of 996,068 tokens.
+#    ~65 silent seconds — fill them with the cache arithmetic from slide 6.
+just longctx
+
+# 9. Close on the same list. "The published reference shape lost to the simpler one."
+just claims
+```
+
+Each beat below says what will appear on screen before the command, so you know what you are
+pointing at.
 
 **Cut order if squeezed:** beat 2, then beat 3's second command, then beat 5's depth sweep.
 Beat 4 is already down to two commands. Don't let it grow back on stage.
@@ -145,7 +198,7 @@ Beat 4 is already down to two commands. Don't let it grow back on stage.
 
 **What you'll see:** six sections. A node list — three machines with 8 GPUs each, plus three
 control-plane nodes with none. Then who holds those GPUs: three lines, one per engine, ending
-in "24 GPU(s) held". Then the RayCluster, the RayJobs and Deployments, the PVC with the weights,
+in "24 GPU(s) held". Then the RayServices and the clusters they own, the PVC with the weights,
 and last a list of the endpoints that answer `/v1/models`.
 
 **Point at:** the 24, and the three separate machine names.
@@ -155,9 +208,9 @@ just state
 ```
 
 > "Three machines, twenty-four B200s, one PVC holding the weights — and all twenty-four GPUs are
-> busy right now: strategy A on one machine, the published reference shape B on the Ray head, and
-> the million-token engine on the third. All three started before the talk, and I'll tell you
-> exactly why in a minute."
+> busy right now: strategy A on one machine, the published reference shape B on the second, and
+> the million-token engine on the third. Each one is a RayService with its own cluster. All three
+> started before the talk, and I'll tell you exactly why in a minute."
 
 Then about twenty seconds on the Nscale console, so they can see it is a real cluster.
 
@@ -253,8 +306,8 @@ just receipt
 `just state`.
 
 **Don't take questions on TP4's internals.** The answer is "it's broken on this build, so it's
-not a shape you'd choose." The gate is the interesting part, not the bug. If someone really
-wants it, the findings are in `30-strategy-pd-single-node.yaml`.
+not a shape you'd choose." The gate is the interesting part, not the bug. The measurement that
+says so is on disk in `metrics/C-pd.json`, which `just receipt` prints.
 
 ### Beat 5 · 9:00–13:00 · The 1M window
 
@@ -272,8 +325,8 @@ just longctx
 > not the tail, the middle, because head-and-tail attention passes a needle test at the edges for
 > free."
 
-While it runs, give the cache arithmetic from slide 6: four times the window costs 1.4× in
-concurrency, and the per-token cache cost falls 2.9×.
+While it runs, give the cache arithmetic from slide 6: four times the window costs 1.3× in
+concurrency, and the per-token cache cost falls 3.1×.
 
 > "Sixty-four seconds to first token at a million tokens of context, served from one machine's
 > HBM. No offloading."
@@ -281,7 +334,20 @@ concurrency, and the per-token cache cost falls 2.9×.
 Then one sentence on D, which is not demoed:
 
 > "Scale-out isn't demoed because 'add machines, get throughput' is self-evident — the non-obvious
-> part was which shape you replicate. We replicate the winner: 1.85× on two machines."
+> part is which shape you replicate. We replicate the winner: 1.75× on two machines, and each
+> replica still does 87% of what it did alone."
+
+**If asked why it's 1.75× and not 2×:** that 0.87 per-replica efficiency is the honest answer, and
+it held at exactly 0.87 before the RayService migration too — so it is a property of the shape,
+not of the orchestration.
+
+**The thing worth telling, if there's time:** D's first measurement on this architecture was
+2751 / 491 / 2641 tok/s with TTFT p95 up to 30.5 s — a 5.6× spread that looked like a broken
+fleet. Nothing was wrong with the GPUs. `build_openai_app` creates **one** ingress actor no matter
+how many engine replicas sit behind it, so both replicas were relaying every streamed token
+through a single Python process, and at 64 concurrent that saturated before the hardware did. One
+line — `ingress_deployment_config: {num_replicas: 2}` — moved it to 3384–4381 with p95 ~1 s.
+Ask what the narrowest thing in the request path is before believing an aggregate.
 
 ### Beat 6 · 13:00–16:00 · The punchline
 

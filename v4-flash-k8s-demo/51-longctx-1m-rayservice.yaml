@@ -1,0 +1,170 @@
+# 51 — THE 1M-CONTEXT ENGINE as a RayService. Same engine as 50, different orchestration.
+#
+#     kubectl apply -f 51-longctx-1m-rayservice.yaml
+#     kubectl -n v4-flash-demo wait --for=condition=Ready rayservice/v4-flash-1m --timeout=40m
+#     just longctx
+#
+# Same engine as strategy A, with the context window opened to 1,048,576 tokens. Measured at
+# 996,068 prompt tokens: TTFT around 63s, with the needle found at five depths.
+#
+# VLLM_USE_BREAKABLE_CUDAGRAPH is required here for the same reason as in 11 (read that header):
+# this is a TP8 engine on the ray executor inside a KubeRay-managed cluster, so the workers are
+# actors that do not observe the variable the engine sets at runtime.
+#
+# THE FLAG STRATEGY A DOES NOT NEED: attention_config.use_fp4_indexer_cache. At a 1M window the
+# attention indexer is what decides whether the KV cache fits at all.
+#
+# STARTUP IS LONGER THAN A'S. FlashInfer autotune alone runs about 8m19s here, then CUDA graph
+# capture, then per-shape TileLang JIT on the first request of each new shape -- so a pod that
+# passes /health can still be minutes away from serving at speed. The hostPath caches below keep
+# the compile work from being repaid on every restart. 11 does not mount them yet; it should.
+apiVersion: ray.io/v1
+kind: RayService
+metadata:
+  name: v4-flash-1m
+  namespace: v4-flash-demo
+spec:
+  # 2400s is not generous here, it is what the startup above actually needs. Serve marks the
+  # application unhealthy if a replica has not become ready inside this window, so a threshold
+  # shorter than the autotune it is waiting on reports a failure that is not one. Size these
+  # from measured cold-start time, not from a default.
+  serviceUnhealthySecondThreshold: 2400
+  deploymentUnhealthySecondThreshold: 2400
+  serveConfigV2: |
+    applications:
+      - name: llm
+        route_prefix: /
+        import_path: ray.serve.llm:build_openai_app
+        args:
+          llm_configs:
+            - model_loading_config:
+                model_id: deepseek-ai/DeepSeek-V4-Flash-0731
+                model_source: /models/DeepSeek-V4-Flash-0731
+              # Copied from 50's command line, which is the verified-correct 1M config.
+              engine_kwargs:
+                distributed_executor_backend: ray
+                tensor_parallel_size: 8
+                enable_expert_parallel: true
+                trust_remote_code: true
+                kv_cache_dtype: fp8
+                block_size: 256
+                # The 1M-specific one. 50 passes this as --attention-config JSON.
+                attention_config:
+                  use_fp4_indexer_cache: true
+                tokenizer_mode: deepseek_v4
+                tool_call_parser: deepseek_v4
+                enable_auto_tool_choice: true
+                reasoning_parser: deepseek_v4
+                max_model_len: 1048576
+              deployment_config:
+                num_replicas: 1
+                # See 11: the TP placement group holds the GPUs, not the replica actor. Putting
+                # 8 here asks for 16 on an 8-GPU node and the group never schedules.
+                ray_actor_options:
+                  num_gpus: 0
+  rayClusterConfig:
+    rayVersion: "2.58.0"
+    headGroupSpec:
+      rayStartParams:
+        num-gpus: "0"
+        dashboard-host: 0.0.0.0
+      template:
+        metadata:
+          # Stable selector for the Service at the bottom -- see 11 for why KubeRay's own
+          # ray.io/cluster label cannot be used. This also keeps `just _endpoints` working: it
+          # probes for pods labelled app=v4-flash-longctx.
+          labels:
+            app: v4-flash-longctx
+        spec:
+          containers:
+            - name: ray-head
+              image: vllm/vllm-openai:v0.27.1
+              env:
+                - { name: PYTHONPATH, value: /models/ray-site-258 }
+                - { name: PATH, value: "/models/ray-site-258/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
+                - { name: HF_HOME, value: /models/hf-cache }
+                - { name: VLLM_ATTENTION_BACKEND, value: FLASHINFER }
+                # Must match the worker group. See 11.
+                - { name: VLLM_USE_BREAKABLE_CUDAGRAPH, value: "1" }
+              resources:
+                requests: { cpu: "8", memory: 32Gi }
+                limits:   { cpu: "16", memory: 64Gi }
+              volumeMounts:
+                - { name: models, mountPath: /models }
+                - { name: shm, mountPath: /dev/shm }
+          volumes:
+            - name: models
+              persistentVolumeClaim: { claimName: v4-flash-models }
+            - name: shm
+              emptyDir: { medium: Memory, sizeLimit: 32Gi }
+    workerGroupSpecs:
+      - groupName: gpu8
+        replicas: 1
+        minReplicas: 1
+        maxReplicas: 1
+        rayStartParams:
+          num-gpus: "8"
+        template:
+          spec:
+            nodeSelector:
+              node.kubernetes.io/instance-type: g.192.b200.8
+            # Never share a machine with a strategy-D replica. A 1M window wants the whole
+            # node's HBM; co-tenancy shows up as a KV-cache OOM at admission, not as a
+            # scheduling error.
+            #
+            # Deliberately does NOT list v4-flash-longctx, which 50's version did. That label is
+            # now on this service's HEAD pod (for the Service selector below), so including it
+            # would forbid the worker from sharing a node with its own head and could leave the
+            # worker unschedulable. The 8-GPU request already keeps engines off each other.
+            affinity:
+              podAntiAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  - labelSelector:
+                      matchExpressions:
+                        - key: app
+                          operator: In
+                          values: ["v4-flash-replica"]
+                    topologyKey: kubernetes.io/hostname
+            containers:
+              - name: ray-worker
+                image: vllm/vllm-openai:v0.27.1
+                env:
+                  - { name: PYTHONPATH, value: /models/ray-site-258 }
+                  - { name: PATH, value: "/models/ray-site-258/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
+                  - { name: HF_HOME, value: /models/hf-cache }
+                  - { name: VLLM_ATTENTION_BACKEND, value: FLASHINFER }
+                  - { name: VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR, value: /root/.cache/flashinfer }
+                  # THE ONE THAT MATTERS -- see 11's header for the full explanation.
+                  - { name: VLLM_USE_BREAKABLE_CUDAGRAPH, value: "1" }
+                resources:
+                  requests: { cpu: "64", memory: 512Gi, nvidia.com/gpu: 8 }
+                  limits:   { cpu: "160", memory: 1400Gi, nvidia.com/gpu: 8 }
+                volumeMounts:
+                  - { name: models, mountPath: /models }
+                  - { name: shm, mountPath: /dev/shm }
+                  # Node-local and already warm from 50's runs. Without these every restart
+                  # repays FlashInfer autotune and the DeepGEMM JIT from scratch.
+                  - { name: jit-cache, mountPath: /root/.cache }
+                  - { name: tilelang-cache, mountPath: /root/.tilelang }
+            volumes:
+              - name: models
+                persistentVolumeClaim: { claimName: v4-flash-models }
+              - name: shm
+                emptyDir: { medium: Memory, sizeLimit: 256Gi }
+              - name: jit-cache
+                hostPath: { path: /var/lib/v4-flash/vllm-cache, type: DirectoryOrCreate }
+              - name: tilelang-cache
+                hostPath: { path: /var/lib/v4-flash/tilelang-cache, type: DirectoryOrCreate }
+---
+# Keeps the endpoint name the demo already uses. See 11's Service for the reasoning.
+apiVersion: v1
+kind: Service
+metadata:
+  name: v4-flash-longctx
+  namespace: v4-flash-demo
+spec:
+  selector:
+    app: v4-flash-longctx
+  ports:
+    - { name: http, port: 8000, targetPort: 8000 }
+    - { name: dashboard, port: 8265, targetPort: 8265 }

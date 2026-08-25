@@ -4,11 +4,10 @@
     python3 show_answer.py /tmp/just-ask.json
 
 A separate file rather than `python3 -c '...'` inside the justfile: multi-line inline Python
-has broken the justfile parser four times, because continuation lines land at column 0 and
-`just` tokenises them as recipe syntax.
+puts continuation lines at column 0, where `just` tokenises them as recipe syntax.
 
-Reports what actually came back instead of raising. `just ask` used to die with a raw
-JSONDecodeError traceback whenever it was pointed at a Service that nothing was serving.
+Reports what actually came back instead of raising, so pointing this at a Service that nothing
+is serving prints a sentence rather than a JSONDecodeError traceback.
 
 WHY THIS SAYS "latency" AND NOT "TTFT". The request is not streamed, so the server buffers
 until generation finishes and time-to-first-byte IS time-to-last-token. Labelling that TTFT

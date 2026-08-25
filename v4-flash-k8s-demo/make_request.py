@@ -3,9 +3,10 @@
 
     python3 make_request.py <model> <prompt> [max_tokens]
 
-Exists for the same reason as show_answer.py: inline multi-line Python in the justfile has
-broken its parser four times. Also guarantees the prompt is JSON-escaped, so a prompt
-containing a quote or a colon cannot corrupt the request or the recipe.
+A file rather than inline Python in the justfile: multi-line Python in a recipe puts
+continuation lines at column 0, where just tokenises them as recipe syntax. It also guarantees
+the prompt is JSON-escaped, so a prompt containing a quote or a colon cannot corrupt the
+request or the recipe.
 """
 import json
 import sys

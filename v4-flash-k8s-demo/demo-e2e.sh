@@ -9,8 +9,8 @@
 #     PAUSE=0 bash demo-e2e.sh        # no pauses between beats (default 4s, for narration)
 #     PAUSE=read bash demo-e2e.sh     # wait for ENTER between beats
 #
-# ⚠ PREP IS DESTRUCTIVE. `just teardown` deletes every strategy Deployment and RayJob in the
-#   namespace. It keeps the RayCluster and the model PVC, so no weights are re-downloaded, but
+# ⚠ PREP IS DESTRUCTIVE. `just teardown` deletes every RayService in the namespace, and with it
+#   the RayCluster each one owns. It keeps the model PVC, so no weights are re-downloaded, but
 #   anything you had serving is gone. --demo-only touches nothing.
 #
 # WHAT IT LEAVES RUNNING: strategy A, strategy B and the 1M engine — 24 of 24 GPUs across three
@@ -58,40 +58,43 @@ echo "  PART 1 — PREP.  Destructive: tears down every strategy, keeps the RayC
 echo "  Expect 10 min if the weights are page-cached, up to 25 from genuinely cold nodes."
 echo "$RULE"
 
-beat "PREP 1/7 · point kubectl at this cluster" \
+beat "PREP 1/8 · point kubectl at this cluster" \
      "the cluster's context name, and the kubeconfig path being exported."
 run just enable-kube
 
-beat "PREP 2/7 · clean slate" \
-     "deletions scrolling past, then a wait until the head holds no strategy GPUs, then 'RayCluster ready'."
+beat "PREP 2/8 · clean slate" \
+     "deletions scrolling past, then a wait until no strategy holds a GPU."
 run just teardown
-run just _ensure-cluster
 
-beat "PREP 3/7 · bring up A, B and the 1M engine in one apply" \
-     "six or seven 'created' lines. They warm in parallel on three different machines."
-run kubectl apply -f 10b-strategy-tep8-deployment.yaml \
-                  -f 20-strategy-dp8-ep.yaml \
-                  -f 50-longctx-1m.yaml
+beat "PREP 3/8 · bring up A, B and the 1M engine in one apply" \
+     "three 'created' lines per file — a RayService and its Service. They warm in parallel on three different machines."
+run kubectl apply -f 11-strategy-tep8-rayservice.yaml \
+                  -f 21-strategy-dp8-ep-rayservice.yaml \
+                  -f 51-longctx-1m-rayservice.yaml
 
-beat "PREP 4/7 · wait for all three" \
-     "nothing for several minutes, then three lines: A ready, B ready, 1M ready. B usually lands first because its check is weaker — it only polls /v1/models, while A and 1M wait for a real generation."
-{ kubectl -n v4-flash-demo rollout status deploy/v4-flash-tep8 --timeout=40m >/dev/null 2>&1 \
+beat "PREP 4/8 · wait for all three" \
+     "nothing for several minutes, then three lines: A ready, B ready, 1M ready. Same signal for each — the RayService Ready condition, which Serve sets from its own health check of the application."
+{ kubectl -n v4-flash-demo wait --for=condition=Ready rayservice/v4-flash-a --timeout=40m >/dev/null 2>&1 \
     && echo "  ✓ A ready   $(elapsed)" || echo "  ⛔ A FAILED"; } &
-{ just wait-ready 8000 v4-flash-openai 2400 >/dev/null 2>&1 \
+{ kubectl -n v4-flash-demo wait --for=condition=Ready rayservice/v4-flash-b --timeout=40m >/dev/null 2>&1 \
     && echo "  ✓ B ready   $(elapsed)" || echo "  ⛔ B FAILED"; } &
-{ kubectl -n v4-flash-demo rollout status deploy/v4-flash-longctx --timeout=40m >/dev/null 2>&1 \
+{ kubectl -n v4-flash-demo wait --for=condition=Ready rayservice/v4-flash-1m --timeout=40m >/dev/null 2>&1 \
     && echo "  ✓ 1M ready  $(elapsed)" || echo "  ⛔ 1M FAILED"; } &
 wait
 
-beat "PREP 5/7 · pre-flight — the check that must say 3/3" \
+beat "PREP 5/8 · pre-flight — the check that must say 3/3" \
      "a table of three endpoints, each with its strategy letter and parallelism, each answering '4'. The last line must read 3/3. If a row is missing, an engine is serving unchecked."
 run just verify-output
 
-beat "PREP 6/7 · prove the million-token needle before showtime" \
+beat "PREP 6/8 · prove the million-token needle before showtime" \
      "a target line, then about 75 seconds of silence, then one line with the real token count, time to first token, and whether the needle was found."
 run just longctx
 
-beat "PREP 7/7 · confirm the closing beat's inputs" \
+beat "PREP 7/8 · warm every endpoint at the shape the demo asks for" \
+     "three short benches, one per engine. Ready is NOT warm: the kernels for a request shape compile on that shape's first request, so without this the demo's first asks pay the compile on stage."
+run just warm
+
+beat "PREP 8/8 · confirm the closing beat's inputs" \
      "the comparison table. Strategy C's column must be ✗ rather than numbers — the demo's beat 4 depends on that."
 run just compare
 

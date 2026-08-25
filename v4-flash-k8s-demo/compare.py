@@ -23,8 +23,12 @@ STRATEGIES = [
      "lowest single-stream latency", "gives up aggregate throughput"),
     ("B-dp8-ep", "B · DP8xEP", "just run-b",
      "the published reference shape", "measured slower here, both axes"),
-    ("C-pd", "C · P/D 4+4", "just run-c",
-     "pools scale independently; biggest cache budget", "a router sits in the path"),
+    # Withdrawn as a strategy, kept as a measurement. Its recorded artifact is the demo's
+    # evidence that throughput cannot report incorrectness, so the row stays even though
+    # there is no recipe to reproduce it any more (`just receipt` prints the artifact).
+    ("C-pd", "C · P/D 4+4", "withdrawn; see just receipt",
+     "pools scale independently; biggest cache budget",
+     "TP4 prefill returns fluent nonsense on this build, so the throughput is unusable"),
     ("D-replicas", "D · replicas", "just run-d",
      "capacity scales per machine, close to linearly, at equal load per replica",
      "buys no per-request speed, and a request already streaming from a killed pod "
@@ -46,13 +50,24 @@ FIELDS = [
 ]
 
 
-def load(dirname):
+def tag_of(path):
+    """The campaign a snapshot belongs to: A-tep8__rayservice2.json -> 'rayservice'."""
+    stem = Path(path).stem
+    suffix = stem.split("__", 1)[1] if "__" in stem else ""
+    return suffix.rstrip("0123456789") or suffix
+
+
+def load(dirname, tag=None):
     """Return {stem: data} using WARM MEDIANS where repeat snapshots exist.
 
     metrics/<stem>.json holds only the LAST run, and the last run is not the strategy: the
-    first passes after a deploy are still warming (D read 2278 against a warm 4836). Reading
-    the single file made this table disagree with `just claims` and with slide 8, both of which
-    use warm medians — A showed 2410.6 here and 2740.5 there. One source of truth instead.
+    first passes after a deploy are still warming. Reading the single file made this table
+    disagree with `just claims` and with slide 8, both of which use warm medians. One source
+    of truth instead.
+
+    `tag` restricts the snapshots to one measurement campaign. metrics/_repeat accumulates runs
+    across architectures, and a median spanning two of them describes no system that ever ran --
+    so the caller passes the campaign it is publishing. Without it, every snapshot counts.
     """
     root = Path(dirname)
     out = {}
@@ -65,7 +80,8 @@ def load(dirname):
             print(f"  ! skipping {f.name}: {exc}", file=sys.stderr)
             continue
         snaps = [q for q in sorted((root / "_repeat").glob(f"{f.stem}__*.json"))
-                 if not q.name.startswith("_")]
+                 if not q.name.startswith("_")
+                 and (tag is None or tag_of(q).startswith(tag))]
         runs = []
         for q in snaps:
             try:
@@ -104,8 +120,14 @@ def cell(data, getter, unit):
 
 
 def main():
-    dirname = sys.argv[1] if len(sys.argv) > 1 else "metrics"
-    data = load(dirname)
+    argv = sys.argv[1:]
+    tag = None
+    if "--tag" in argv:
+        i = argv.index("--tag")
+        tag = argv[i + 1]
+        del argv[i:i + 2]
+    dirname = argv[0] if argv else "metrics"
+    data = load(dirname, tag)
     if not data:
         print(f"No metrics in {dirname}/ yet. Run a strategy first, e.g.:\n")
         for _, label, cmd, *_ in STRATEGIES:
