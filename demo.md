@@ -137,7 +137,8 @@ just warm
 just compare
 ```
 
-**Not scriptable, do it now:** open the Ray dashboard (`just dashboard`), open the Nscale
+**Not scriptable, do it now:** open the Ray dashboard for the strategy you'll talk about first
+(`just dashboard a` — there is one dashboard per strategy now), open the Nscale
 console page **and log in** — it's behind SSO — and have the recorded clips of each beat ready
 as a fallback.
 
@@ -153,9 +154,11 @@ under three minutes, so the rest of the slot is you. The annotated beats follow 
 #    Point at the 24 and the three separate machine names.
 just state
 
-# 1b. The Ray dashboard — placement groups, actors, which GPU each rank got.
+# 1b. The Ray dashboard. NAME THE STRATEGY — there are three RayClusters up, one per
+#     strategy, so there are three dashboards. `just dashboard` alone means A.
 #     BLOCKS until Ctrl-C, so give it its own tab; do not paste it mid-sequence.
-just dashboard
+#     A second one needs a second port: `just dashboard b 8266`.
+just dashboard a
 
 # 2. It talks. One live answer, ~2 s. Says on screen that this is a SHORT prompt,
 #    not the million-token one — otherwise the room assumes they just saw that test.

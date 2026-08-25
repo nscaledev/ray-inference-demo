@@ -158,13 +158,40 @@ wait-ready port="8000" svc="v4-flash-openai" budget="540":
     exit 1
 
 # Ray dashboard — placement groups, actors, GPU assignment. Blocks; Ctrl-C to stop.
-[doc("Ray dashboard on :8265 (blocks; Ctrl-C to stop)")]
-dashboard port="8265":
+#
+# TAKES A STRATEGY, because there is no longer one dashboard to open. Every strategy is its own
+# RayService owning its own RayCluster, so there are as many dashboards as there are strategies
+# up -- three during the demo. This recipe used to port-forward a single hardcoded Service, which
+# was right when A, B and C were RayJobs sharing one cluster; under RayService it silently showed
+# B's dashboard whatever you were talking about. Pointing at eight DP replicas while narrating
+# A's tensor-parallel placement group is the kind of wrong that an audience spots.
+#
+#     just dashboard          # A, the deck's headline shape
+#     just dashboard b        # the published reference shape
+#     just dashboard 1m       # the long-context engine
+#     just dashboard d        # the scale-out fleet, when it is up
+[doc("Ray dashboard for one strategy: a|b|1m|d (blocks; Ctrl-C to stop)")]
+dashboard strategy="a" port="8265":
     #!/usr/bin/env bash
     set -uo pipefail
-    echo "Ray dashboard -> http://localhost:{{port}}   (Ctrl-C to stop)"
+    case "{{strategy}}" in
+      a|A)        rs=v4-flash-a;         label="A · TP8 + EP" ;;
+      b|B)        rs=v4-flash-b;         label="B · DP8 x EP + DSpark" ;;
+      b-nospec)   rs=v4-flash-b-nospec;  label="B without DSpark" ;;
+      1m|1M)      rs=v4-flash-1m;        label="1M window" ;;
+      d|D)        rs=v4-flash-d;         label="D · whole replicas" ;;
+      *) echo "unknown strategy '{{strategy}}' — use a, b, b-nospec, 1m or d"; exit 2 ;;
+    esac
+    # The head Service KubeRay creates is <cluster>-head-svc, and the cluster name carries a
+    # generated suffix, so resolve it from the RayService rather than guessing the name.
+    cluster=$(kubectl -n {{ns}} get rayservice "$rs" \
+                -o jsonpath='{.status.activeServiceStatus.rayClusterName}' 2>/dev/null)
+    [ -n "$cluster" ] || cluster=$(kubectl -n {{ns}} get rayservice "$rs" \
+                -o jsonpath='{.status.pendingServiceStatus.rayClusterName}' 2>/dev/null)
+    [ -n "$cluster" ] || { echo "$rs is not up — nothing to open"; exit 1; }
+    echo "Ray dashboard for $label  ($cluster)  -> http://localhost:{{port}}   (Ctrl-C to stop)"
     command -v open >/dev/null && (sleep 2 && open "http://localhost:{{port}}" >/dev/null 2>&1 &) || true
-    exec kubectl -n {{ns}} port-forward svc/v4-flash-openai {{port}}:8265
+    exec kubectl -n {{ns}} port-forward "svc/${cluster}-head-svc" {{port}}:8265
 
 # Per-GPU utilisation and memory, from inside whichever pod holds the GPUs.
 [doc("Per-GPU utilisation and memory, from inside the pods holding them")]
